@@ -1,6 +1,6 @@
-# Domain Integrity Engine
+# DIVE — Domain Integrity Verification Engine
 
-Domain Integrity Engine is a deterministic domain governance and infrastructure integrity monitoring system that snapshots, compares, and classifies operational drift over time.
+DIVE is a deterministic domain governance and infrastructure integrity monitoring system that snapshots, compares, and classifies operational drift over time.
 
 ## Core Capabilities
 
@@ -24,7 +24,7 @@ The system is designed for repeatable and auditable outcomes:
 
 ## Non-Goals
 
-Domain Integrity Engine is intentionally not:
+DIVE is intentionally not:
 
 - An attack surface scanner
 - A vulnerability scanner
@@ -113,7 +113,7 @@ This README intentionally avoids a full deployment walkthrough.
 
 ## Commercial Direction
 
-This repository represents the reference implementation of the Domain Integrity Engine.
+This repository represents the reference implementation of the Domain Integrity Verification Engine.
 Commercial deployment models and managed offerings may be developed in the future.
 
 ## Roadmap Summary (0.1.x)
