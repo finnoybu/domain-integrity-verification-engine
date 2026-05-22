@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import tls from "tls";
 import { promises as dns } from "dns";
+import { getLicenseStatus, type LicenseStatus } from "./license";
 
 export interface DomainSOA {
   primaryNs: string;
@@ -1098,4 +1099,69 @@ export async function getDomainStatus(domain: string): Promise<StatusResult> {
       domain_state: "invalid",
     };
   }
+}
+
+// ============================================================================
+// Licensing — domain capacity enforcement
+// ============================================================================
+
+export interface DomainAccess {
+  /** Resolved license status driving the capacity. */
+  license: LicenseStatus;
+  /** Effective number of domains that may be actively monitored. */
+  limit: number;
+  /** Domains within the limit — fully active. */
+  active: string[];
+  /** Domains beyond the limit — frozen until capacity is restored. */
+  frozen: string[];
+}
+
+/**
+ * Resolves domain capacity from the current license and the store.
+ *
+ * Domains keep their insertion order in the store (earliest-added first), so
+ * the first `limit` are active and any beyond that are frozen. Frozen domains
+ * are never deleted — they are simply not (re)snapshotted until capacity is
+ * restored by a valid license.
+ */
+export async function getDomainAccess(): Promise<DomainAccess> {
+  const license = getLicenseStatus();
+  const limit = license.domainLimit;
+  const domains = await getDomains();
+  return {
+    license,
+    limit,
+    active: domains.slice(0, limit),
+    frozen: domains.slice(limit),
+  };
+}
+
+/**
+ * Determines whether a snapshot may be created for `domain` under the current
+ * license: an existing active domain is allowed; an existing frozen domain is
+ * denied; a new domain is allowed only when there is free capacity.
+ */
+export async function canSnapshotDomain(
+  domain: string,
+): Promise<{ allowed: boolean; reason: string }> {
+  const access = await getDomainAccess();
+
+  if (access.frozen.includes(domain)) {
+    return {
+      allowed: false,
+      reason: `Domain is frozen — beyond the licensed limit of ${access.limit}. ${access.license.reason}`,
+    };
+  }
+  if (access.active.includes(domain)) {
+    return { allowed: true, reason: "Domain is within the licensed limit." };
+  }
+
+  const total = access.active.length + access.frozen.length;
+  if (total >= access.limit) {
+    return {
+      allowed: false,
+      reason: `Domain limit reached (${access.limit}). ${access.license.reason}`,
+    };
+  }
+  return { allowed: true, reason: "Within the licensed limit." };
 }
