@@ -38,18 +38,19 @@ begins with the ownership check:
 
 1. Resolve TXT `_dive-challenge.<domain>`.
 2. **Pass** — a record exists and exactly matches the issued token.
-3. **Fail** — the record is absent, or its value differs from the token.
+3. **Fail** — the record is absent, its value differs from the token, or the
+   lookup cannot complete.
 
-On pass → proceed to the snapshot / diff / classification pipeline. On fail →
-**stop**: no RDAP, DNS, TLS, or classification is performed. The cycle records
-an ownership failure and raises a notification.
+On pass → the consecutive-failure counter resets and the snapshot / diff /
+classification pipeline proceeds. On fail → **stop**: no RDAP, DNS, TLS, or
+classification is performed for that domain this cycle, and the
+consecutive-failure counter increments.
 
-**Definitive failure vs. transient lookup error.** A single failed TXT lookup
-is not proof the record is gone — resolvers time out and networks blip. The
-check distinguishes a *definitive* result (NXDOMAIN, or a record present but
-not matching) from a *lookup error* (timeout, resolver failure). `ownership_failed`
-is declared only on a definitive failure, or after a configurable number of
-consecutive lookup errors — so transient DNS hiccups do not raise false alarms.
+**Three strikes.** A single failed check is not proof the record is gone —
+resolvers time out and networks blip. `ownership_failed` is declared on the
+**third consecutive failed check**; any passing check resets the counter to
+zero. This absorbs transient DNS hiccups without false alarms, while still
+catching a genuinely removed or altered record within three cycles.
 
 ## Ownership is a first-class state
 
@@ -58,12 +59,15 @@ domain resolves to one of:
 
 - `ownership_unverified` — never verified (just added; token not yet found).
 - `ownership_verified` — proceed to stability classification as today.
-- `ownership_failed` — was verified; the record is now missing or changed.
+- `ownership_failed` — three consecutive checks have failed; the record is
+  missing, altered, or unreachable.
 
 `ownership_unverified` and `ownership_failed` short-circuit — no `domain_state`
 or `stability_state` is computed. `ownership_failed` is the highest-severity
 event DIVE emits, above `critical`: loss of control of the domain subsumes any
-drift finding.
+drift finding. Between a first failed check and the third, the domain holds its
+`ownership_verified` state, but each failing cycle still pauses its snapshot
+pipeline.
 
 ## Notification
 
@@ -75,8 +79,8 @@ failed. Recovery — the record restored — is also a transition worth notifyin
 ## Data model
 
 Each domain entry gains: the verification token, the ownership state, the time
-ownership was last verified, the time it last failed, and a consecutive
-lookup-error counter. Extends the filesystem store.
+ownership was last verified, the time it last failed, and a
+consecutive-failure counter. Extends the filesystem store.
 
 ## Flow
 
@@ -106,8 +110,8 @@ same gate.
 
 ## Open questions
 
-- How strict is "definitive vs transient" — how many consecutive lookup errors
-  before `ownership_failed`, and the per-check lookup timeout.
+- The per-check TXT-lookup timeout (the consecutive-failure threshold is fixed
+  at three).
 - Token rotation / re-issue, and whether a verified domain is ever re-tokenized.
 - Relationship to the existing `domain_state: invalid` — a fully dead domain
   also fails the TXT lookup; which state takes precedence and how they are
