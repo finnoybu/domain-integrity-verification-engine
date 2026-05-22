@@ -5,13 +5,10 @@ Parameters
 Licensor:             Finnoybu Operations, LLC
 Licensed Work:        DIVE — Domain Integrity Verification Engine.
                       The Licensed Work is © 2026 Finnoybu IP LLC.
-Additional Use Grant: You may make production use of the Licensed Work,
-                      provided that you do not offer the Licensed Work, or a
-                      modified version of it, to third parties as a hosted or
-                      managed commercial service whose value derives
-                      substantially from the domain-monitoring, snapshotting,
-                      diffing, or classification functionality of the
-                      Licensed Work.
+Additional Use Grant: You may make production use of the Licensed Work for your
+                      own personal purposes, or for your organization's own
+                      internal business operations, when such use monitors no
+                      more than three (3) domains in total.
 Change Date:          2030-05-22
 Change License:       Apache License, Version 2.0
 
