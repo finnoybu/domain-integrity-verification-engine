@@ -1,11 +1,20 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { DomainSnapshot } from "@/lib/storage";
 
 interface DomainData {
   domain: string;
   snapshot: DomainSnapshot;
+  active: boolean;
+}
+
+interface LicenseInfo {
+  licensed: boolean;
+  tier: string | null;
+  domainLimit: number;
+  expires: string | null;
+  expired: boolean;
 }
 
 interface StatusSignal {
@@ -48,6 +57,7 @@ export default function Home() {
   const [addingDomain, setAddingDomain] = useState(false);
   const [newDomain, setNewDomain] = useState("");
   const [error, setError] = useState<string>("");
+  const [license, setLicense] = useState<LicenseInfo | null>(null);
   
   const [status, setStatus] = useState<StatusResult | null>(null);
   const [history, setHistory] = useState<HistorySnapshot[]>([]);
@@ -56,24 +66,30 @@ export default function Home() {
   const [showDiff, setShowDiff] = useState(false);
   const [showRawJson, setShowRawJson] = useState(false);
 
-  // Load domains on mount and initialize selected domain
-  useEffect(() => {
-    (async () => {
-      try {
-        const response = await fetch("/api/snapshot");
-        if (!response.ok) throw new Error("Failed to load domains");
-        const data = await response.json();
-        const domainsList = data.domains || [];
-        setDomains(domainsList);
-        // Only set selected domain if not already selected
-        if (domainsList.length > 0) {
-          setSelectedDomain(domainsList[0].domain);
-        }
-      } catch (err) {
-        setError(String(err));
-      }
-    })();
+  // Load domains and license capacity from the API
+  const loadDomains = useCallback(async (): Promise<DomainData[]> => {
+    try {
+      const response = await fetch("/api/snapshot");
+      if (!response.ok) throw new Error("Failed to load domains");
+      const data = await response.json();
+      const domainsList: DomainData[] = data.domains || [];
+      setDomains(domainsList);
+      setLicense(data.license || null);
+      return domainsList;
+    } catch (err) {
+      setError(String(err));
+      return [];
+    }
   }, []);
+
+  // Load domains on mount and initialize the selected domain
+  useEffect(() => {
+    loadDomains().then((domainsList) => {
+      if (domainsList.length > 0) {
+        setSelectedDomain(domainsList[0].domain);
+      }
+    });
+  }, [loadDomains]);
 
   async function handleAddDomain() {
     if (!newDomain.trim()) {
@@ -92,7 +108,9 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error("Failed to add domain");
+        const errData = await response.json().catch(() => null);
+        setError(errData?.message || "Failed to add domain");
+        return;
       }
 
       const newDomainData = await response.json();
@@ -104,7 +122,7 @@ export default function Home() {
       // Add the new domain to the list and select it
       setDomains((prevDomains) => [
         ...prevDomains,
-        { domain: addedDomain, snapshot: newDomainData },
+        { domain: addedDomain, snapshot: newDomainData, active: true },
       ]);
       setSelectedDomain(addedDomain);
     } catch (err) {
@@ -119,31 +137,36 @@ export default function Home() {
     
     if (!domain) return;
 
-    // Auto-snapshot on domain select
     setLoading(true);
     setError("");
 
+    // Frozen domains are beyond the licensed limit — never (re)snapshot them.
+    const isFrozen = domains.find((d) => d.domain === domain)?.active === false;
+
     try {
-      const response = await fetch("/api/snapshot", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domain }),
-      });
+      if (!isFrozen) {
+        // Auto-snapshot on selecting an active domain
+        const response = await fetch("/api/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ domain }),
+        });
 
-      if (!response.ok) {
-        throw new Error("Failed to create snapshot");
-      }
+        if (!response.ok) {
+          const errData = await response.json().catch(() => null);
+          throw new Error(errData?.message || "Failed to create snapshot");
+        }
 
-      // Fetch only the latest snapshot for this domain (don't reload all domains)
-      const latestResponse = await fetch(`/api/snapshot/latest?domain=${domain}`);
-      if (latestResponse.ok) {
-        const latestSnapshot = await latestResponse.json();
-        // Update the domains list with the new snapshot for this domain only
-        setDomains((prevDomains) =>
-          prevDomains.map((d) =>
-            d.domain === domain ? { domain, snapshot: latestSnapshot } : d
-          )
-        );
+        // Refresh this domain's snapshot in the list (preserve its active flag)
+        const latestResponse = await fetch(`/api/snapshot/latest?domain=${domain}`);
+        if (latestResponse.ok) {
+          const latestSnapshot = await latestResponse.json();
+          setDomains((prevDomains) =>
+            prevDomains.map((d) =>
+              d.domain === domain ? { ...d, snapshot: latestSnapshot } : d
+            )
+          );
+        }
       }
       
       // Fetch status data
@@ -192,10 +215,8 @@ export default function Home() {
         throw new Error("Failed to delete domain");
       }
 
-      // Remove domain from state and clear selection
-      setDomains((prevDomains) =>
-        prevDomains.filter((d) => d.domain !== selectedDomain)
-      );
+      // Reload so capacity and active/frozen flags reflect the freed slot
+      await loadDomains();
       setSelectedDomain("");
     } catch (err) {
       setError(String(err));
@@ -204,7 +225,11 @@ export default function Home() {
     }
   }
 
-  const selectedSnapshot = domains.find((d) => d.domain === selectedDomain)?.snapshot;
+  const selectedDomainData = domains.find((d) => d.domain === selectedDomain);
+  const selectedSnapshot = selectedDomainData?.snapshot;
+  const selectedFrozen = selectedDomainData ? !selectedDomainData.active : false;
+  const frozenCount = domains.filter((d) => !d.active).length;
+  const frozenSentence = frozenCount === 1 ? "1 domain is" : `${frozenCount} domains are`;
   
   // Group signals by severity (descending order: critical, risk, drift, stable)
   const groupedSignals = status?.signals
@@ -243,6 +268,56 @@ export default function Home() {
           </div>
         )}
 
+        {license && (frozenCount > 0 || license.expired) && (
+          <div
+            style={{
+              padding: "1rem",
+              backgroundColor: "#fef3c7",
+              color: "#92400e",
+              borderRadius: "6px",
+              marginBottom: "1rem",
+              border: "1px solid #f59e0b",
+              fontSize: "0.9rem",
+            }}
+          >
+            {license.expired
+              ? `Your ${license.tier ?? "license"} expired on ${license.expires}. DIVE reverted to the Free tier (${license.domainLimit}-domain limit).${frozenCount > 0 ? ` ${frozenSentence} now frozen.` : ""}`
+              : `${frozenSentence} frozen — beyond the ${license.licensed ? (license.tier ?? "current") : "Free"} tier limit of ${license.domainLimit} domains. Frozen domains keep their last snapshot and resume monitoring when capacity is restored: add or renew a license, or delete a domain.`}
+          </div>
+        )}
+
+        {license && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.5rem",
+              flexWrap: "wrap",
+              marginBottom: "0.75rem",
+              fontSize: "0.875rem",
+              color: frozenCount > 0 ? "#92400e" : "#6b7280",
+            }}
+          >
+            <span style={{ fontWeight: 600 }}>
+              {domains.length} / {license.domainLimit} domains
+            </span>
+            <span>·</span>
+            <span>{license.licensed ? (license.tier ?? "Licensed") : "Free tier"}</span>
+            {license.licensed && license.expires && (
+              <>
+                <span>·</span>
+                <span>expires {license.expires}</span>
+              </>
+            )}
+            {frozenCount > 0 && (
+              <>
+                <span>·</span>
+                <span style={{ fontWeight: 600 }}>{frozenCount} frozen</span>
+              </>
+            )}
+          </div>
+        )}
+
         <div
           style={{
             display: "flex",
@@ -277,7 +352,7 @@ export default function Home() {
               .sort((a, b) => a.domain.localeCompare(b.domain))
               .map((d) => (
                 <option key={d.domain} value={d.domain}>
-                  {d.domain}
+                  {d.domain}{d.active ? "" : " — frozen"}
                 </option>
               ))}
           </select>
@@ -388,6 +463,24 @@ export default function Home() {
 
         {selectedSnapshot && status && (
           <>
+            {selectedFrozen && (
+              <div
+                style={{
+                  padding: "1rem",
+                  backgroundColor: "#fef3c7",
+                  color: "#92400e",
+                  borderRadius: "6px",
+                  marginBottom: "1.5rem",
+                  border: "1px solid #f59e0b",
+                  fontSize: "0.9rem",
+                }}
+              >
+                This domain is <strong>frozen</strong> — beyond your licensed
+                capacity. Monitoring is paused; the dashboard below shows the
+                last snapshot, from {new Date(selectedSnapshot.timestamp).toLocaleString()}.
+              </div>
+            )}
+
             {/* Invalid Domain Block */}
             {status.domain_state === "invalid" && (
               <div
