@@ -118,7 +118,20 @@ interface DomainStore {
 
 const DATA_FILE = path.join(process.cwd(), "data", "domains.json");
 const SAMPLE_FILE = path.join(process.cwd(), "data", "domains.sample.json");
-export const MAX_SNAPSHOTS_PER_DOMAIN = 2;
+/**
+ * Snapshots retained per domain. Configurable via the SNAPSHOT_RETENTION
+ * environment variable; defaults to 30 (about a month of daily history).
+ * A floor of 2 is enforced so the diff engine always has a prior snapshot.
+ */
+function resolveSnapshotRetention(): number {
+  const configured = Number(process.env.SNAPSHOT_RETENTION);
+  if (Number.isInteger(configured) && configured >= 2) {
+    return configured;
+  }
+  return 30;
+}
+
+export const MAX_SNAPSHOTS_PER_DOMAIN = resolveSnapshotRetention();
 
 /**
  * Returns a canonical base DomainSnapshot with all fields present (v0.0.7 schema).
@@ -469,7 +482,7 @@ export async function getLatestSnapshot(domain: string): Promise<DomainSnapshot 
 }
 
 /**
- * Gets all snapshots for a domain (max 2), sorted newest first.
+ * Gets all snapshots for a domain (up to the retention limit), newest first.
  */
 export async function getSnapshotHistory(domain: string): Promise<DomainSnapshot[]> {
   return listSnapshotsForDomain(domain);
