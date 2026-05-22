@@ -1,7 +1,8 @@
 {
-  "name": "finnoybu-org",
-  "version": "0.1.0",
+  "name": "domain-integrity-verification-engine",
+  "version": "0.1.9",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
