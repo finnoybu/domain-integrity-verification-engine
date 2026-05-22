@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { promises as dns } from "dns";
 import tls from "tls";
-import { DomainSnapshot, getCanonicalBase, persistSnapshot, isValidDomain } from "@/lib/storage";
+import { DomainSnapshot, getCanonicalBase, persistSnapshot, isValidDomain, canSnapshotDomain } from "@/lib/storage";
 import {
   badRequest,
   enforceRateLimit,
   getRequestId,
   internalError,
+  licenseLimitReached,
   logServerError,
   notFound,
 } from "@/lib/api-helpers";
@@ -479,8 +480,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, message: "Domain deleted" });
     }
 
-    // Default action: create/update snapshot and persist to disk
-    // But first check if domain is valid
+    // Default action: create/update snapshot and persist to disk.
+    // Enforce the licensed domain capacity before any network work.
+    const access = await canSnapshotDomain(normalizedDomain);
+    if (!access.allowed) {
+      return licenseLimitReached(access.reason, requestId);
+    }
+
+    // Check whether the domain is valid
     const valid = await isValidDomain(normalizedDomain);
     
     const snapshot = await createSnapshot(normalizedDomain);
@@ -506,17 +513,28 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const { getDomains, getDomainSnapshot } = await import("@/lib/storage");
-    const domains = await getDomains();
+    const { getDomainSnapshot, getDomainAccess } = await import("@/lib/storage");
+    const access = await getDomainAccess();
+    const allDomains = [...access.active, ...access.frozen];
 
     const domainsList = await Promise.all(
-      domains.map(async (domain) => {
+      allDomains.map(async (domain) => {
         const snapshot = await getDomainSnapshot(domain);
-        return { domain, snapshot };
+        return { domain, snapshot, active: access.active.includes(domain) };
       })
     );
 
-    return NextResponse.json({ domains: domainsList });
+    return NextResponse.json({
+      domains: domainsList,
+      license: {
+        licensed: access.license.licensed,
+        tier: access.license.tier,
+        domainLimit: access.limit,
+        expires: access.license.expires,
+        expired: access.license.expired,
+        reason: access.license.reason,
+      },
+    });
   } catch (error) {
     logServerError(requestId, "GET snapshot error", error);
     return internalError("Failed to fetch domains", requestId);

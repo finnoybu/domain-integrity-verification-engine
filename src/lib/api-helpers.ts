@@ -5,7 +5,8 @@ export type ErrorCode =
   | "not_found"
   | "rate_limited"
   | "upstream_failure"
-  | "internal_error";
+  | "internal_error"
+  | "license_limit";
 
 interface ErrorPayload {
   error: string;
@@ -55,6 +56,13 @@ export function badRequest(message: string, requestId?: string): NextResponse<Er
 
 export function notFound(message: string, requestId?: string): NextResponse<ErrorPayload> {
   return errorResponse("not_found", message, 404, { requestId });
+}
+
+export function licenseLimitReached(
+  message: string,
+  requestId?: string,
+): NextResponse<ErrorPayload> {
+  return errorResponse("license_limit", message, 403, { requestId });
 }
 
 export function upstreamFailure(message: string, requestId?: string): NextResponse<ErrorPayload> {
