@@ -2,7 +2,7 @@
   "name": "domain-integrity-verification-engine",
   "version": "0.1.9",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "BUSL-1.1",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

@@ -740,7 +740,7 @@ export default function Home() {
           textAlign: "center",
         }}
       >
-        © 2026 Finnoybu IP LLC. Licensed under the Apache License 2.0.
+        © 2026 Finnoybu IP LLC. Licensed under the Business Source License 1.1.
       </footer>
     </div>
   );
