@@ -1,0 +1,189 @@
+import { createPublicKey, verify } from "node:crypto";
+
+/**
+ * Offline license verification for DIVE.
+ *
+ * A license is a single signed string the customer places in the DIVE_LICENSE
+ * environment variable. It is verified locally against the public key embedded
+ * below — there is no call back to a licensing server.
+ *
+ * DIVE is source-available: this check is deterrence, not DRM. It keeps honest
+ * deployments compliant; it is not, and cannot be, tamper-proof.
+ *
+ * See docs/licensing-design.md for the full design.
+ */
+
+/**
+ * Ed25519 public key (SPKI PEM) used to verify license tokens.
+ *
+ * Replace the empty string below with the public key printed by
+ * `node scripts/license-keys.mjs`. While it is empty, every deployment runs at
+ * the free tier — licensing is treated as not yet provisioned.
+ */
+const LICENSE_PUBLIC_KEY_PEM = "";
+
+/** Domains monitorable without a license. */
+export const FREE_DOMAIN_LIMIT = 3;
+
+/** Supported license payload version. */
+const LICENSE_VERSION = 1;
+
+export interface LicenseStatus {
+  /** True only when a present token is valid, well-formed, and unexpired. */
+  licensed: boolean;
+  /** Effective domain limit — FREE_DOMAIN_LIMIT whenever `licensed` is false. */
+  domainLimit: number;
+  /** Tier label from the token, or null when unlicensed. */
+  tier: string | null;
+  /** Customer identifier from the token, or null when unlicensed. */
+  customer: string | null;
+  /** Expiry date (ISO yyyy-mm-dd) from the token, or null when absent. */
+  expires: string | null;
+  /** True when a token was present but its expiry date has passed. */
+  expired: boolean;
+  /** Human-readable explanation of the resolved state. */
+  reason: string;
+}
+
+interface LicensePayload {
+  v: number;
+  licenseId: string;
+  customer: string;
+  tier: string;
+  domainLimit: number;
+  issued: string;
+  expires: string;
+}
+
+function freeTier(reason: string, extra?: Partial<LicenseStatus>): LicenseStatus {
+  return {
+    licensed: false,
+    domainLimit: FREE_DOMAIN_LIMIT,
+    tier: null,
+    customer: null,
+    expires: null,
+    expired: false,
+    reason,
+    ...extra,
+  };
+}
+
+/** Decode and structurally validate a base64url-encoded payload segment. */
+function decodePayload(segment: string): LicensePayload | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(segment, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const p = parsed as Record<string, unknown>;
+  if (
+    typeof p.v !== "number" ||
+    typeof p.licenseId !== "string" ||
+    typeof p.customer !== "string" ||
+    typeof p.tier !== "string" ||
+    typeof p.domainLimit !== "number" ||
+    !Number.isInteger(p.domainLimit) ||
+    p.domainLimit < 1 ||
+    typeof p.issued !== "string" ||
+    typeof p.expires !== "string"
+  ) {
+    return null;
+  }
+  return {
+    v: p.v,
+    licenseId: p.licenseId,
+    customer: p.customer,
+    tier: p.tier,
+    domainLimit: p.domainLimit,
+    issued: p.issued,
+    expires: p.expires,
+  };
+}
+
+/**
+ * Resolve a raw license token into an effective LicenseStatus.
+ *
+ * Pure and synchronous: the token and `now` are passed explicitly. Any failure
+ * — absent, malformed, bad signature, expired — resolves safely to the free
+ * tier; DIVE never refuses to run because of licensing.
+ *
+ * In production `now` should be a rollback-resistant time (see the clock
+ * handling in docs/licensing-design.md); it defaults to the system clock.
+ */
+export function verifyLicense(
+  rawToken: string | undefined | null,
+  now: Date = new Date(),
+): LicenseStatus {
+  if (!rawToken || rawToken.trim() === "") {
+    return freeTier("No license configured.");
+  }
+  if (LICENSE_PUBLIC_KEY_PEM.trim() === "") {
+    return freeTier("Licensing is not provisioned in this build.");
+  }
+
+  const parts = rawToken.trim().split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return freeTier("Malformed license token.");
+  }
+  const [payloadB64, signatureB64] = parts;
+
+  let signatureValid = false;
+  try {
+    const publicKey = createPublicKey(LICENSE_PUBLIC_KEY_PEM);
+    signatureValid = verify(
+      null,
+      Buffer.from(payloadB64, "utf8"),
+      publicKey,
+      Buffer.from(signatureB64, "base64url"),
+    );
+  } catch {
+    return freeTier("License signature could not be verified.");
+  }
+  if (!signatureValid) {
+    return freeTier("License signature is invalid.");
+  }
+
+  const payload = decodePayload(payloadB64);
+  if (!payload) {
+    return freeTier("Malformed license payload.");
+  }
+  if (payload.v !== LICENSE_VERSION) {
+    return freeTier(`Unsupported license version (${payload.v}).`);
+  }
+
+  const expiresAt = new Date(`${payload.expires}T23:59:59Z`);
+  if (Number.isNaN(expiresAt.getTime())) {
+    return freeTier("License has an invalid expiry date.");
+  }
+  if (now.getTime() > expiresAt.getTime()) {
+    return freeTier(`License expired on ${payload.expires}.`, {
+      expires: payload.expires,
+      expired: true,
+    });
+  }
+
+  return {
+    licensed: true,
+    domainLimit: Math.max(payload.domainLimit, FREE_DOMAIN_LIMIT),
+    tier: payload.tier,
+    customer: payload.customer,
+    expires: payload.expires,
+    expired: false,
+    reason: `Licensed: ${payload.tier} (${payload.domainLimit} domains), expires ${payload.expires}.`,
+  };
+}
+
+/**
+ * Resolve the license from the DIVE_LICENSE environment variable.
+ *
+ * Thin wrapper over verifyLicense for the runtime path. The enforcement wiring
+ * (graceful downgrade, rollback-resistant clock) is layered on top of this in a
+ * later change — see docs/licensing-design.md.
+ */
+export function getLicenseStatus(): LicenseStatus {
+  return verifyLicense(process.env.DIVE_LICENSE);
+}
