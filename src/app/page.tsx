@@ -80,6 +80,11 @@ export default function Home() {
   
   const [showDiff, setShowDiff] = useState(false);
   const [showRawJson, setShowRawJson] = useState(false);
+  // Last successfully-copied verification token. Drives the transient
+  // "Copied!" label on the Copy token button; cleared by the timeout the
+  // handler arms (or implicitly when the user switches to a different
+  // domain, whose token won't match).
+  const [copiedToken, setCopiedToken] = useState<string | null>(null);
 
   // Load domains and license capacity from the API
   const loadDomains = useCallback(async (): Promise<DomainData[]> => {
@@ -175,6 +180,42 @@ export default function Home() {
       setError(String(err));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleCopyToken(token: string) {
+    // Primary path: the async Clipboard API. Available on localhost and
+    // any HTTPS origin; missing on plain HTTP (non-secure contexts).
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(token);
+      } else {
+        // Fallback for non-secure contexts — a hidden textarea + the
+        // legacy execCommand("copy") path. Old but universally supported.
+        const textarea = document.createElement("textarea");
+        textarea.value = token;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        if (!ok) throw new Error("copy command rejected by browser");
+      }
+      setCopiedToken(token);
+      // Clear the transient state after 1.5s — but only if no later copy
+      // has overwritten it in the meantime.
+      setTimeout(
+        () => setCopiedToken((current) => (current === token ? null : current)),
+        1500,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `Copy failed: ${err.message}. Select and copy the token manually.`
+          : "Copy failed. Select and copy the token manually.",
+      );
     }
   }
 
@@ -603,21 +644,20 @@ export default function Home() {
                   {loading ? "Verifying..." : "Verify"}
                 </button>
                 <button
-                  onClick={() => {
-                    navigator.clipboard?.writeText(selectedDomainData.ownership!.token);
-                  }}
+                  onClick={() => handleCopyToken(selectedDomainData.ownership!.token)}
                   style={{
                     padding: "0.625rem 1.25rem",
-                    backgroundColor: "#f3f4f6",
-                    color: "#111827",
-                    border: "1px solid #d1d5db",
+                    backgroundColor: copiedToken === selectedDomainData.ownership!.token ? "#d1fae5" : "#f3f4f6",
+                    color: copiedToken === selectedDomainData.ownership!.token ? "#065f46" : "#111827",
+                    border: `1px solid ${copiedToken === selectedDomainData.ownership!.token ? "#a7f3d0" : "#d1d5db"}`,
                     borderRadius: 6,
                     cursor: "pointer",
                     fontWeight: 500,
                     fontSize: "0.95rem",
+                    transition: "background-color 150ms ease, color 150ms ease, border-color 150ms ease",
                   }}
                 >
-                  Copy token
+                  {copiedToken === selectedDomainData.ownership!.token ? "Copied!" : "Copy token"}
                 </button>
               </div>
             </div>
