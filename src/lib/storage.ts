@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import tls from "tls";
@@ -108,11 +109,59 @@ export interface DomainSnapshot {
   riskScore?: number;
 }
 
+/**
+ * Three-state ownership lifecycle per `docs/ownership-verification-design.md`.
+ * `unverified` and `failed` short-circuit the snapshot pipeline; only
+ * `verified` lets a check proceed.
+ */
+export type OwnershipState =
+  | "ownership_unverified"
+  | "ownership_verified"
+  | "ownership_failed";
+
+/**
+ * Per-domain ownership verification record. The operator publishes `token` as a
+ * TXT record at `_dive-challenge.<domain>`; every monitor / snapshot cycle
+ * re-resolves it and updates this record. `consecutiveFailures` reaches 3 →
+ * `state` becomes `ownership_failed` (see ownership-verification-design.md).
+ */
+export interface OwnershipRecord {
+  token: string;
+  state: OwnershipState;
+  verifiedAt: string | null;
+  failedAt: string | null;
+  consecutiveFailures: number;
+}
+
 interface DomainStore {
   domains: {
     [domain: string]: {
       lastSnapshot: DomainSnapshot;
+      ownership: OwnershipRecord;
     };
+  };
+}
+
+/**
+ * DNS name at which the operator publishes the per-domain verification token.
+ * Isolated from the apex so SPF / DMARC TXT records don't collide.
+ */
+export function ownershipVerificationRecord(domain: string): string {
+  return `_dive-challenge.${domain}`;
+}
+
+/**
+ * Generates a fresh ownership record with a 32-byte base64url token and a
+ * starting `ownership_unverified` state. New domains and lazy migrations of
+ * pre-ownership entries both call this.
+ */
+export function createOwnershipRecord(): OwnershipRecord {
+  return {
+    token: crypto.randomBytes(32).toString("base64url"),
+    state: "ownership_unverified",
+    verifiedAt: null,
+    failedAt: null,
+    consecutiveFailures: 0,
   };
 }
 
@@ -254,11 +303,40 @@ async function ensureDataFile() {
   }
 }
 
+/**
+ * Lazy-migrates pre-ownership store entries by minting a fresh ownership
+ * record (state: ownership_unverified) for any domain that lacks one. Mutates
+ * the input in place and returns true if any entry was migrated, so callers
+ * can persist the migrated store back to disk.
+ */
+function migrateOwnershipRecords(store: DomainStore): boolean {
+  let migrated = false;
+  for (const domain of Object.keys(store.domains)) {
+    const entry = store.domains[domain] as {
+      lastSnapshot: DomainSnapshot;
+      ownership?: OwnershipRecord;
+    };
+    if (!entry.ownership) {
+      entry.ownership = createOwnershipRecord();
+      migrated = true;
+    }
+  }
+  return migrated;
+}
+
 export async function readStore(): Promise<DomainStore> {
   try {
     await ensureDataFile();
     const data = await fs.readFile(DATA_FILE, "utf-8");
-    return JSON.parse(data);
+    const parsed = JSON.parse(data) as DomainStore;
+    if (!parsed.domains) {
+      return { domains: {} };
+    }
+    if (migrateOwnershipRecords(parsed)) {
+      // Persist the migrated store so the token is stable across reads.
+      await writeStore(parsed);
+    }
+    return parsed;
   } catch (error) {
     console.error("Error reading store:", error);
     return { domains: {} };
@@ -298,7 +376,11 @@ function validateSnapshot(snapshot: DomainSnapshot): DomainSnapshot {
 export async function addDomain(domain: string, snapshot: DomainSnapshot): Promise<void> {
   const validatedSnapshot = validateSnapshot(snapshot);
   const store = await readStore();
-  store.domains[domain] = { lastSnapshot: validatedSnapshot };
+  const existing = store.domains[domain];
+  store.domains[domain] = {
+    lastSnapshot: validatedSnapshot,
+    ownership: existing?.ownership ?? createOwnershipRecord(),
+  };
   await writeStore(store);
 }
 
@@ -309,6 +391,52 @@ export async function updateDomain(domain: string, snapshot: DomainSnapshot): Pr
     store.domains[domain].lastSnapshot = validatedSnapshot;
     await writeStore(store);
   }
+}
+
+/**
+ * Reserves a slot in the store for a newly added domain without taking a
+ * snapshot: mints an ownership token, sets `ownership_unverified`, and
+ * records a placeholder canonical snapshot so downstream consumers always see
+ * a complete schema. Returns the issued ownership record. Idempotent — if the
+ * domain is already registered, the existing record is returned unchanged.
+ */
+export async function registerDomain(
+  domain: string,
+  timestamp: string = new Date().toISOString(),
+): Promise<OwnershipRecord> {
+  const store = await readStore();
+  const existing = store.domains[domain];
+  if (existing) {
+    return existing.ownership;
+  }
+
+  const ownership = createOwnershipRecord();
+  store.domains[domain] = {
+    // Placeholder snapshot until the first real fetch — keeps the canonical
+    // schema invariant intact for any reader that hits the store before
+    // ownership is verified.
+    lastSnapshot: getCanonicalBase(domain, timestamp),
+    ownership,
+  };
+  await writeStore(store);
+  return ownership;
+}
+
+export async function getOwnership(domain: string): Promise<OwnershipRecord | null> {
+  const store = await readStore();
+  return store.domains[domain]?.ownership ?? null;
+}
+
+export async function setOwnership(
+  domain: string,
+  ownership: OwnershipRecord,
+): Promise<void> {
+  const store = await readStore();
+  if (!store.domains[domain]) {
+    return;
+  }
+  store.domains[domain].ownership = ownership;
+  await writeStore(store);
 }
 
 export async function deleteDomain(domain: string): Promise<boolean> {
@@ -458,11 +586,17 @@ export async function persistSnapshot(domain: string, snapshot: DomainSnapshot):
   // Enforce retention policy in one place
   await enforceSnapshotRetention(domain);
   
-  // Also update the legacy store for backward compatibility
+  // Also update the legacy store for backward compatibility.
+  // Preserve the existing ownership record (lazy migration in readStore
+  // ensures one exists; mint a fresh one defensively if not).
   const store = await readStore();
-  store.domains[domain] = { lastSnapshot: validatedSnapshot };
+  const existing = store.domains[domain];
+  store.domains[domain] = {
+    lastSnapshot: validatedSnapshot,
+    ownership: existing?.ownership ?? createOwnershipRecord(),
+  };
   await writeStore(store);
-  
+
   return filepath;
 }
 

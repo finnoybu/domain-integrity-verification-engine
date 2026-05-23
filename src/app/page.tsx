@@ -3,9 +3,24 @@
 import { useState, useEffect, useCallback } from "react";
 import { DomainSnapshot } from "@/lib/storage";
 
+type OwnershipState =
+  | "ownership_unverified"
+  | "ownership_verified"
+  | "ownership_failed";
+
+interface OwnershipRecord {
+  token: string;
+  state: OwnershipState;
+  verifiedAt: string | null;
+  failedAt: string | null;
+  consecutiveFailures: number;
+}
+
 interface DomainData {
   domain: string;
   snapshot: DomainSnapshot;
+  ownership: OwnershipRecord | null;
+  verificationRecord: string;
   active: boolean;
 }
 
@@ -101,10 +116,12 @@ export default function Home() {
     setError("");
 
     try {
+      // Phase 1: "add" registers and issues a verification token; no snapshot
+      // is taken until the user publishes the TXT record and clicks Verify.
       const response = await fetch("/api/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domain: newDomain.trim() }),
+        body: JSON.stringify({ domain: newDomain.trim(), action: "add" }),
       });
 
       if (!response.ok) {
@@ -113,18 +130,47 @@ export default function Home() {
         return;
       }
 
-      const newDomainData = await response.json();
-      const addedDomain = newDomainData.domain;
-      
+      const added: {
+        domain: string;
+        ownership: OwnershipRecord;
+        verificationRecord: string;
+      } = await response.json();
+
       setNewDomain("");
       setAddingDomain(false);
-      
-      // Add the new domain to the list and select it
-      setDomains((prevDomains) => [
-        ...prevDomains,
-        { domain: addedDomain, snapshot: newDomainData, active: true },
-      ]);
-      setSelectedDomain(addedDomain);
+
+      // Reload the list so capacity and ordering reflect the new entry, then
+      // select it — the verification panel renders for the unverified state.
+      await loadDomains();
+      setSelectedDomain(added.domain);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleVerifyDomain(domain: string) {
+    if (!domain) return;
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch("/api/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain, action: "verify" }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => null);
+        setError(errData?.message || "Verification failed");
+        return;
+      }
+
+      // On success the server already took the first snapshot. Reload and
+      // re-select so the dashboard refreshes with full data.
+      await loadDomains();
+      await handleDomainSelect(domain);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -134,14 +180,29 @@ export default function Home() {
 
   async function handleDomainSelect(domain: string) {
     setSelectedDomain(domain);
-    
+
     if (!domain) return;
 
     setLoading(true);
     setError("");
 
     // Frozen domains are beyond the licensed limit — never (re)snapshot them.
-    const isFrozen = domains.find((d) => d.domain === domain)?.active === false;
+    const selected = domains.find((d) => d.domain === domain);
+    const isFrozen = selected?.active === false;
+    // Ownership-gated paths skip the auto-snapshot client-side. The server
+    // gate lands in Phase 2; this keeps the UI honest in the meantime.
+    const isUnverified =
+      !!selected?.ownership && selected.ownership.state !== "ownership_verified";
+
+    if (isUnverified) {
+      // No snapshot exists yet; clear stale status / history / diff from a
+      // previously-selected domain so the verification panel renders cleanly.
+      setStatus(null);
+      setHistory([]);
+      setDiff([]);
+      setLoading(false);
+      return;
+    }
 
     try {
       if (!isFrozen) {
@@ -350,11 +411,17 @@ export default function Home() {
             {domains
               .slice()
               .sort((a, b) => a.domain.localeCompare(b.domain))
-              .map((d) => (
-                <option key={d.domain} value={d.domain}>
-                  {d.domain}{d.active ? "" : " — frozen"}
-                </option>
-              ))}
+              .map((d) => {
+                const badges: string[] = [];
+                if (!d.active) badges.push("frozen");
+                if (d.ownership?.state === "ownership_unverified") badges.push("unverified");
+                if (d.ownership?.state === "ownership_failed") badges.push("ownership failed");
+                return (
+                  <option key={d.domain} value={d.domain}>
+                    {d.domain}{badges.length > 0 ? ` — ${badges.join(", ")}` : ""}
+                  </option>
+                );
+              })}
           </select>
 
           <button
@@ -460,6 +527,97 @@ export default function Home() {
             </button>
           </div>
         )}
+
+        {selectedDomainData?.ownership &&
+          selectedDomainData.ownership.state !== "ownership_verified" && (
+            <div
+              style={{
+                backgroundColor: "white",
+                padding: "1.75rem",
+                borderRadius: "8px",
+                marginBottom: "1.5rem",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.1)",
+                borderLeft: `4px solid ${
+                  selectedDomainData.ownership.state === "ownership_failed"
+                    ? SEVERITY_COLORS.critical
+                    : "#3b82f6"
+                }`,
+              }}
+            >
+              <div style={{ fontSize: "0.75rem", fontWeight: 700, color: "#6b7280", letterSpacing: "0.05em", marginBottom: "0.5rem" }}>
+                {selectedDomainData.ownership.state === "ownership_failed"
+                  ? "OWNERSHIP VERIFICATION FAILED"
+                  : "OWNERSHIP VERIFICATION REQUIRED"}
+              </div>
+              <h2 style={{ margin: "0 0 0.75rem 0", fontSize: "1.4rem", fontWeight: 600, color: "#111827" }}>
+                Publish the verification record for {selectedDomain}
+              </h2>
+              <p style={{ margin: "0 0 1.25rem 0", color: "#374151", fontSize: "0.95rem", lineHeight: 1.55 }}>
+                DIVE proves control of every monitored domain on every check. Publish a TXT record at the
+                name below containing the issued token, then click <strong>Verify</strong>. The first snapshot
+                runs as soon as the record is found.
+              </p>
+
+              <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "0.5rem 1rem", alignItems: "center", marginBottom: "1rem", fontSize: "0.875rem" }}>
+                <span style={{ color: "#6b7280", fontWeight: 500 }}>Record type</span>
+                <code style={{ fontFamily: "ui-monospace, monospace", backgroundColor: "#f3f4f6", padding: "0.25rem 0.5rem", borderRadius: 4 }}>TXT</code>
+
+                <span style={{ color: "#6b7280", fontWeight: 500 }}>Name</span>
+                <code style={{ fontFamily: "ui-monospace, monospace", backgroundColor: "#f3f4f6", padding: "0.25rem 0.5rem", borderRadius: 4, wordBreak: "break-all" }}>
+                  {selectedDomainData.verificationRecord}
+                </code>
+
+                <span style={{ color: "#6b7280", fontWeight: 500 }}>Value</span>
+                <code style={{ fontFamily: "ui-monospace, monospace", backgroundColor: "#f3f4f6", padding: "0.25rem 0.5rem", borderRadius: 4, wordBreak: "break-all" }}>
+                  {selectedDomainData.ownership.token}
+                </code>
+              </div>
+
+              {selectedDomainData.ownership.state === "ownership_failed" && (
+                <div style={{ padding: "0.75rem 1rem", backgroundColor: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca", borderRadius: 6, fontSize: "0.875rem", marginBottom: "1rem" }}>
+                  {selectedDomainData.ownership.consecutiveFailures} consecutive ownership checks have failed.
+                  Re-publish the TXT record and verify to resume monitoring.
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                <button
+                  onClick={() => handleVerifyDomain(selectedDomain)}
+                  disabled={loading}
+                  style={{
+                    padding: "0.625rem 1.25rem",
+                    backgroundColor: "#059669",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 6,
+                    cursor: loading ? "not-allowed" : "pointer",
+                    fontWeight: 500,
+                    fontSize: "0.95rem",
+                    opacity: loading ? 0.7 : 1,
+                  }}
+                >
+                  {loading ? "Verifying..." : "Verify"}
+                </button>
+                <button
+                  onClick={() => {
+                    navigator.clipboard?.writeText(selectedDomainData.ownership!.token);
+                  }}
+                  style={{
+                    padding: "0.625rem 1.25rem",
+                    backgroundColor: "#f3f4f6",
+                    color: "#111827",
+                    border: "1px solid #d1d5db",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                    fontWeight: 500,
+                    fontSize: "0.95rem",
+                  }}
+                >
+                  Copy token
+                </button>
+              </div>
+            </div>
+          )}
 
         {selectedSnapshot && status && (
           <>
@@ -801,11 +959,13 @@ export default function Home() {
           </>
         )}
 
-        {!selectedSnapshot && selectedDomain && (
-          <div style={{ backgroundColor: "white", padding: "2rem", borderRadius: "8px", textAlign: "center", color: "#6b7280" }}>
-            <p>No snapshot data available. Select a domain to fetch.</p>
-          </div>
-        )}
+        {!selectedSnapshot &&
+          selectedDomain &&
+          selectedDomainData?.ownership?.state === "ownership_verified" && (
+            <div style={{ backgroundColor: "white", padding: "2rem", borderRadius: "8px", textAlign: "center", color: "#6b7280" }}>
+              <p>No snapshot data available. Select a domain to fetch.</p>
+            </div>
+          )}
 
         {!selectedDomain && domains.length > 0 && (
           <div style={{ backgroundColor: "white", padding: "2rem", borderRadius: "8px", textAlign: "center", color: "#6b7280" }}>
