@@ -146,4 +146,5 @@ Commercial deployment models and managed offerings may be developed in the futur
 
 Licensed under the Business Source License 1.1 — source-available, with each version converting to the Apache License 2.0 four years after its release. Licensor: Finnoybu Operations, LLC. See the [LICENSE](LICENSE) file for the full terms.
 
-© 2026 Finnoybu IP LLC.
+© 2026 Finnoybu.com. Licensed under the Business Source License 1.1.
+Finnoybu.com and subdomains are operated by Finnoybu Operations LLC.

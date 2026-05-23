@@ -997,7 +997,9 @@ export default function Home() {
           textAlign: "center",
         }}
       >
-        © 2026 Finnoybu IP LLC. Licensed under the Business Source License 1.1.
+        © 2026 Finnoybu.com. Licensed under the Business Source License 1.1.
+        <br />
+        Finnoybu.com and subdomains are operated by Finnoybu Operations LLC.
       </footer>
     </div>
   );
