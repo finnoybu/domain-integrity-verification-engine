@@ -133,11 +133,25 @@ export interface OwnershipRecord {
   consecutiveFailures: number;
 }
 
+/**
+ * Per-domain record of the last classification the monitor *dispatched an
+ * alert on*. Used by the alerting layer to deduplicate: alerts fire only
+ * when the current state differs from the last alerted one. Optional on the
+ * store entry — populated lazily by the alerting code on first observation
+ * (so we don't alert-spam at startup).
+ */
+export interface LastAlertedRecord {
+  stabilityState: string | null;
+  ownershipState: string | null;
+  lastAlertedAt: string | null;
+}
+
 interface DomainStore {
   domains: {
     [domain: string]: {
       lastSnapshot: DomainSnapshot;
       ownership: OwnershipRecord;
+      lastAlerted?: LastAlertedRecord;
     };
   };
 }
@@ -378,6 +392,7 @@ export async function addDomain(domain: string, snapshot: DomainSnapshot): Promi
   const store = await readStore();
   const existing = store.domains[domain];
   store.domains[domain] = {
+    ...(existing ?? {}),
     lastSnapshot: validatedSnapshot,
     ownership: existing?.ownership ?? createOwnershipRecord(),
   };
@@ -436,6 +451,25 @@ export async function setOwnership(
     return;
   }
   store.domains[domain].ownership = ownership;
+  await writeStore(store);
+}
+
+export async function getLastAlerted(
+  domain: string,
+): Promise<LastAlertedRecord | null> {
+  const store = await readStore();
+  return store.domains[domain]?.lastAlerted ?? null;
+}
+
+export async function setLastAlerted(
+  domain: string,
+  record: LastAlertedRecord,
+): Promise<void> {
+  const store = await readStore();
+  if (!store.domains[domain]) {
+    return;
+  }
+  store.domains[domain].lastAlerted = record;
   await writeStore(store);
 }
 
@@ -588,10 +622,12 @@ export async function persistSnapshot(domain: string, snapshot: DomainSnapshot):
   
   // Also update the legacy store for backward compatibility.
   // Preserve the existing ownership record (lazy migration in readStore
-  // ensures one exists; mint a fresh one defensively if not).
+  // ensures one exists; mint a fresh one defensively if not) and any other
+  // auxiliary fields (lastAlerted, etc.).
   const store = await readStore();
   const existing = store.domains[domain];
   store.domains[domain] = {
+    ...(existing ?? {}),
     lastSnapshot: validatedSnapshot,
     ownership: existing?.ownership ?? createOwnershipRecord(),
   };

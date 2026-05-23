@@ -34,6 +34,18 @@ This document defines deployment expectations for Domain Integrity Engine.
 - `DIVE_LICENSE` — license token, if any. Determines the active-domain
   capacity the worker iterates each tick.
 
+### Optional — alert email channel
+
+Used only when the email channel is enabled in `alerts.local.json`. SMTP
+credentials are read from the environment, never the config file.
+
+- `DIVE_SMTP_HOST` — SMTP relay host (e.g. `email-smtp.us-east-1.amazonaws.com`).
+- `DIVE_SMTP_PORT` — SMTP port (default `587`).
+- `DIVE_SMTP_USER` — SMTP username, if authentication is required.
+- `DIVE_SMTP_PASS` — SMTP password / token.
+- `DIVE_SMTP_SECURE` — `true` to use TLS from connection start (port 465);
+  otherwise STARTTLS on the configured port.
+
 ## Runtime Requirements
 
 - Node.js 20+
@@ -67,9 +79,39 @@ your log collector / `journald`). It shares the app's filesystem store
 (`data/`), so it must run on the same host as the Next.js process. Graceful
 shutdown: SIGINT / SIGTERM lets the current tick complete, then exits cleanly;
 a second signal exits immediately. Frozen (over-capacity) domains are skipped
-automatically. Phase D (alerting on transitions) is not in this build; the
-worker logs state transitions today and a future PR adds email / webhook
-dispatch on top.
+automatically.
+
+### Alerting
+
+State transitions detected by the worker (stability + ownership) fire alerts
+through any channel enabled in `alerts.local.json`. The file is read once at
+worker startup — restart the worker to reload it. Copy `alerts.sample.json`
+to `alerts.local.json` (gitignored, like `ruleset.local.json`) and edit:
+
+```jsonc
+{
+  "channels": {
+    "email":   { "enabled": false, "from": "dive@you.com", "to": ["ops@you.com"] },
+    "webhook": { "enabled": false, "url": "https://hooks.slack.com/services/…" }
+  },
+  "severities": { "info": false, "warning": true, "critical": true }
+}
+```
+
+- Both channels default to disabled — DIVE computes and logs alert events
+  either way, but nothing dispatches until at least one is enabled.
+- SMTP credentials for the email channel come from `DIVE_SMTP_*` env vars
+  (see above); the config holds only the from/to lists, so a redacted
+  config is safe to share.
+- The webhook channel POSTs `{ "events": [...] }` to the configured URL,
+  with a 10s timeout and any extra `headers` you set.
+- Severity is inferred from the new state: `critical` for risk / critical /
+  invalid / ownership_failed; `warning` for drift; `info` for stable
+  recoveries and verified-ownership confirmations.
+- Dedup is persisted per-domain in the store (`lastAlerted`), so transitions
+  alert exactly once and a worker restart does not re-fire alerts for the
+  current state. The first observation of a domain initialises the record
+  silently.
 
 ### Process management (sketch)
 
