@@ -9,7 +9,7 @@ import {
   setOwnership,
 } from "@/lib/storage";
 import { createSnapshot } from "@/lib/snapshot";
-import { verifyOwnership } from "@/lib/ownership";
+import { recordOwnershipCheck, verifyOwnership } from "@/lib/ownership";
 import {
   badRequest,
   enforceRateLimit,
@@ -19,6 +19,7 @@ import {
   licenseLimitReached,
   logServerError,
   notFound,
+  ownershipFailed,
 } from "@/lib/api-helpers";
 
 export async function POST(request: NextRequest) {
@@ -111,12 +112,40 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Default action: create/update snapshot and persist to disk.
-    // Enforce the licensed domain capacity before any network work.
-    // (Ownership-gating of this path lands in Phase 2.)
+    // Default action: re-snapshot an already-registered domain. License
+    // check first, then the unconditional ownership gate — no RDAP / DNS /
+    // TLS work runs until the per-cycle TXT proof-of-control passes.
     const access = await canSnapshotDomain(normalizedDomain);
     if (!access.allowed) {
       return licenseLimitReached(access.reason, requestId);
+    }
+
+    const existingOwnership = await getOwnership(normalizedDomain);
+    if (!existingOwnership) {
+      // Pre-ownership API contract auto-created on first snapshot; the new
+      // contract requires explicit registration so the operator sees the
+      // TXT challenge before any check runs.
+      return notFound(
+        `Domain ${normalizedDomain} is not registered. Add it first with action: "add", publish the TXT challenge at ${ownershipVerificationRecord(normalizedDomain)}, then verify.`,
+        requestId,
+      );
+    }
+
+    // Ownership gate — applies the three-strikes counter rule. On pass, the
+    // record is refreshed to ownership_verified; on fail, the counter ticks
+    // and the third consecutive failure flips state to ownership_failed.
+    const ownershipCheck = await recordOwnershipCheck(normalizedDomain);
+    if (!ownershipCheck.result.pass) {
+      const found = ownershipCheck.result.foundRecords;
+      const detail =
+        ownershipCheck.result.reason === "token_mismatch"
+          ? `TXT records at ${ownershipVerificationRecord(normalizedDomain)} do not match the issued token. Found: ${found.length === 0 ? "(none)" : found.join(", ")}.`
+          : `TXT lookup for ${ownershipVerificationRecord(normalizedDomain)} did not complete.`;
+      const stateNote =
+        ownershipCheck.ownership.state === "ownership_failed"
+          ? ` Ownership state is now ownership_failed after ${ownershipCheck.ownership.consecutiveFailures} consecutive failed checks.`
+          : ` ${ownershipCheck.ownership.consecutiveFailures} of 3 consecutive failures.`;
+      return ownershipFailed(`${detail}${stateNote}`, requestId);
     }
 
     // Check whether the domain is valid

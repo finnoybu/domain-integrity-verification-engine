@@ -6,7 +6,8 @@ export type ErrorCode =
   | "rate_limited"
   | "upstream_failure"
   | "internal_error"
-  | "license_limit";
+  | "license_limit"
+  | "ownership_failed";
 
 interface ErrorPayload {
   error: string;
@@ -63,6 +64,19 @@ export function licenseLimitReached(
   requestId?: string,
 ): NextResponse<ErrorPayload> {
   return errorResponse("license_limit", message, 403, { requestId });
+}
+
+/**
+ * Returned when a request would otherwise proceed but the domain has not
+ * passed its proof-of-control check. The TXT-based ownership gate is
+ * unconditional (see docs/ownership-verification-design.md), so this is
+ * surfaced as 403 — the server understood the request and refuses.
+ */
+export function ownershipFailed(
+  message: string,
+  requestId?: string,
+): NextResponse<ErrorPayload> {
+  return errorResponse("ownership_failed", message, 403, { requestId });
 }
 
 export function upstreamFailure(message: string, requestId?: string): NextResponse<ErrorPayload> {

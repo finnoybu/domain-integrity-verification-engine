@@ -252,6 +252,10 @@ export default function Home() {
       }
     } catch (err) {
       setError(String(err));
+      // A snapshot-time failure may have shifted ownership state server-side
+      // (the three-strikes counter on the per-call ownership gate). Refresh
+      // the list so the verification panel renders if needed.
+      await loadDomains();
     } finally {
       setLoading(false);
     }
