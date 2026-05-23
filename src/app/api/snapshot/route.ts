@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { persistSnapshot, isValidDomain, canSnapshotDomain } from "@/lib/storage";
+import {
+  canSnapshotDomain,
+  getOwnership,
+  isValidDomain,
+  ownershipVerificationRecord,
+  persistSnapshot,
+  registerDomain,
+  setOwnership,
+} from "@/lib/storage";
 import { createSnapshot } from "@/lib/snapshot";
+import { verifyOwnership } from "@/lib/ownership";
 import {
   badRequest,
   enforceRateLimit,
+  errorResponse,
   getRequestId,
   internalError,
   licenseLimitReached,
@@ -39,8 +49,71 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, message: "Domain deleted" });
     }
 
+    if (action === "add") {
+      // Register the domain without snapshotting. Issues an ownership token;
+      // the user publishes it at _dive-challenge.<domain> and then verifies.
+      const access = await canSnapshotDomain(normalizedDomain);
+      if (!access.allowed) {
+        return licenseLimitReached(access.reason, requestId);
+      }
+
+      const ownership = await registerDomain(normalizedDomain);
+      return NextResponse.json(
+        {
+          domain: normalizedDomain,
+          ownership,
+          verificationRecord: ownershipVerificationRecord(normalizedDomain),
+        },
+        { status: 201 },
+      );
+    }
+
+    if (action === "verify") {
+      // User-initiated setup verification: TXT lookup against the stored
+      // token. On pass — mark verified and take the first snapshot inline.
+      // On fail — surface the lookup detail without touching the strike
+      // counter (that's reserved for unattended monitor checks).
+      const ownership = await getOwnership(normalizedDomain);
+      if (!ownership) {
+        return notFound("Domain not registered", requestId);
+      }
+
+      const result = await verifyOwnership(normalizedDomain, ownership.token);
+
+      if (!result.pass) {
+        const detail =
+          result.reason === "token_mismatch"
+            ? `TXT records at ${ownershipVerificationRecord(normalizedDomain)} do not match the issued token. Found: ${result.foundRecords.length === 0 ? "(none)" : result.foundRecords.join(", ")}.`
+            : `TXT lookup for ${ownershipVerificationRecord(normalizedDomain)} did not complete. ${result.detail ?? ""}`.trim();
+        return errorResponse("invalid_input", detail, 400, { requestId });
+      }
+
+      const now = new Date().toISOString();
+      const verifiedOwnership = {
+        ...ownership,
+        state: "ownership_verified" as const,
+        verifiedAt: now,
+        consecutiveFailures: 0,
+      };
+      await setOwnership(normalizedDomain, verifiedOwnership);
+
+      // First snapshot inline — the operator sees data immediately on verify.
+      const valid = await isValidDomain(normalizedDomain);
+      const snapshot = await createSnapshot(normalizedDomain);
+      if (valid) {
+        await persistSnapshot(normalizedDomain, snapshot);
+      }
+
+      return NextResponse.json({
+        domain: normalizedDomain,
+        ownership: verifiedOwnership,
+        snapshot,
+      });
+    }
+
     // Default action: create/update snapshot and persist to disk.
     // Enforce the licensed domain capacity before any network work.
+    // (Ownership-gating of this path lands in Phase 2.)
     const access = await canSnapshotDomain(normalizedDomain);
     if (!access.allowed) {
       return licenseLimitReached(access.reason, requestId);
@@ -79,7 +152,14 @@ export async function GET(request: NextRequest) {
     const domainsList = await Promise.all(
       allDomains.map(async (domain) => {
         const snapshot = await getDomainSnapshot(domain);
-        return { domain, snapshot, active: access.active.includes(domain) };
+        const ownership = await getOwnership(domain);
+        return {
+          domain,
+          snapshot,
+          ownership,
+          verificationRecord: ownershipVerificationRecord(domain),
+          active: access.active.includes(domain),
+        };
       })
     );
 
