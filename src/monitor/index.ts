@@ -34,6 +34,12 @@ import {
 } from "@/lib/storage";
 import { createSnapshot } from "@/lib/snapshot";
 import { OWNERSHIP_FAILURE_THRESHOLD, recordOwnershipCheck } from "@/lib/ownership";
+import {
+  loadAlertConfig,
+  processAlerts,
+  type AlertConfig,
+  type CurrentStates,
+} from "@/lib/alerting";
 
 const DEFAULT_INTERVAL_SECONDS = 3600;
 const MIN_INTERVAL_SECONDS = 60;
@@ -96,7 +102,11 @@ function sleepUntilStoppedOrDeadline(ms: number): Promise<void> {
   });
 }
 
-async function runTickForDomain(domain: string, prev: PerDomainStates): Promise<void> {
+async function runTickForDomain(
+  domain: string,
+  prev: PerDomainStates,
+  alertConfig: AlertConfig,
+): Promise<void> {
   try {
     const existing = await getOwnership(domain);
     if (!existing) {
@@ -118,11 +128,16 @@ async function runTickForDomain(domain: string, prev: PerDomainStates): Promise<
       prev.ownership.set(domain, ownershipState);
     }
 
+    // Build the alerting "current states" object: ownership is always
+    // observed; stability only when the gate passes.
+    const alertCurrent: CurrentStates = { ownershipState };
+
     if (!check.result.pass) {
       const reason = check.result.reason;
       log(
         `${domain} ownership=${ownershipState} (${reason}; ${check.ownership.consecutiveFailures}/${OWNERSHIP_FAILURE_THRESHOLD}) → skip`,
       );
+      await dispatchAndLog(domain, alertCurrent, alertConfig);
       return;
     }
 
@@ -145,12 +160,40 @@ async function runTickForDomain(domain: string, prev: PerDomainStates): Promise<
       prev.stability.set(domain, stability);
     }
     log(`${domain} ownership=verified stability=${stability}`);
+
+    alertCurrent.stabilityState = stability;
+    await dispatchAndLog(domain, alertCurrent, alertConfig);
   } catch (error) {
     logError(`${domain} tick error: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-async function runTick(prev: PerDomainStates): Promise<void> {
+async function dispatchAndLog(
+  domain: string,
+  current: CurrentStates,
+  alertConfig: AlertConfig,
+): Promise<void> {
+  const result = await processAlerts(domain, current, alertConfig);
+  if (result.initialized) {
+    log(
+      `${domain} alert state initialized (stability=${current.stabilityState ?? "(unobserved)"}, ownership=${current.ownershipState ?? "(unobserved)"})`,
+    );
+    return;
+  }
+  for (const event of result.events) {
+    log(
+      `${domain} ALERT [${event.severity}] ${event.kind}: ${event.from ?? "(unknown)"} → ${event.to}`,
+    );
+  }
+  if (result.dispatched > 0) {
+    log(`${domain} dispatched to ${result.dispatched} channel(s)`);
+  }
+  for (const err of result.errors) {
+    logError(`${domain} alert channel ${err.channel} failed: ${err.error}`);
+  }
+}
+
+async function runTick(prev: PerDomainStates, alertConfig: AlertConfig): Promise<void> {
   const access = await getDomainAccess();
   log(
     `tick start — ${access.active.length} active, ${access.frozen.length} frozen (skipped), license=${access.license.tier ?? "free"}`,
@@ -168,7 +211,7 @@ async function runTick(prev: PerDomainStates): Promise<void> {
       log(`${domain} ${capacity.reason} → skip`);
       continue;
     }
-    await runTickForDomain(domain, prev);
+    await runTickForDomain(domain, prev, alertConfig);
   }
 
   log("tick complete");
@@ -181,13 +224,21 @@ async function main(): Promise<void> {
     `starting — interval=${intervalSeconds}s, ownership-lookup-timeout=${process.env.OWNERSHIP_LOOKUP_TIMEOUT_MS ?? "5000"}ms, retention=${process.env.SNAPSHOT_RETENTION ?? "30"}`,
   );
 
+  // Alerting config is loaded once at startup; restart the worker to reload
+  // alerts.local.json. Channel-disabled by default — events are computed
+  // and logged either way, but nothing dispatches until the config opts in.
+  const alertConfig = await loadAlertConfig();
+  log(
+    `alerting — email=${alertConfig.channels.email.enabled ? "on" : "off"}, webhook=${alertConfig.channels.webhook.enabled ? "on" : "off"}, severities=${Object.entries(alertConfig.severities).filter(([, v]) => v).map(([k]) => k).join(",") || "(none)"}`,
+  );
+
   const prev: PerDomainStates = {
     ownership: new Map(),
     stability: new Map(),
   };
 
   while (!stopRequested) {
-    await runTick(prev);
+    await runTick(prev, alertConfig);
     if (stopRequested) break;
     log(`sleeping ${intervalSeconds}s`);
     await sleepUntilStoppedOrDeadline(intervalSeconds * 1000);

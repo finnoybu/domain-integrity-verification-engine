@@ -1,0 +1,21 @@
+{
+  "_doc": "Copy to alerts.local.json (gitignored, like ruleset.local.json) and edit. Both channels default to disabled — DIVE will compute and log alert events without dispatching until at least one channel is enabled. SMTP credentials live in env vars (DIVE_SMTP_HOST, DIVE_SMTP_PORT, DIVE_SMTP_USER, DIVE_SMTP_PASS, DIVE_SMTP_SECURE).",
+  "channels": {
+    "email": {
+      "enabled": false,
+      "from": "dive-alerts@your-domain.com",
+      "to": ["ops@your-domain.com"]
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "https://hooks.slack.com/services/...",
+      "method": "POST",
+      "headers": {}
+    }
+  },
+  "severities": {
+    "info": false,
+    "warning": true,
+    "critical": true
+  }
+}
