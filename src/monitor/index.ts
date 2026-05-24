@@ -1,45 +1,24 @@
 /**
- * DIVE monitor worker — Monitor Phase C + Ownership Phase 3.
+ * DIVE monitor — dev-loop wrapper.
  *
- * A long-running Node process (run via `npm run monitor`) that ticks on a
- * configurable interval and, for each active domain:
+ * Runs `runOneTick()` repeatedly with a sleep between passes, for local
+ * development convenience (terminal-watching during work on monitor / alerting
+ * code). Invoked via `npm run monitor`.
  *
- *   1. step 0 — runs the ownership check (`recordOwnershipCheck`). A failed
- *      check increments the strike counter and the third consecutive failure
- *      flips state to `ownership_failed`. A failing tick stops here — no
- *      RDAP / DNS / TLS work runs for that domain this cycle.
- *   2. on pass — snapshots the domain (`createSnapshot` + `persistSnapshot`)
- *      and classifies it (`getDomainStatus`).
+ * **Production scheduling uses `npm run monitor:tick` under cron / systemd
+ * timers / a platform scheduler** — see docs/deployment.md. This wrapper is
+ * not designed for production: it loses no data on a crash (state is in the
+ * store), but a long-lived process is the wrong shape for the work the
+ * monitor actually does (~30 s per domain, interval measured in hours).
  *
- * State transitions (ownership_unverified ↔ ownership_verified ↔
- * ownership_failed, and stable / drift / risk / critical) are detected
- * against an in-memory per-domain map and logged. Alert dispatch comes in
- * Phase D — for now transitions are the seed that Phase D will read.
+ * Configuration:
+ *   - MONITOR_INTERVAL  seconds between ticks (default 3600, min 60)
  *
- * Configuration is via environment variables (see docs/deployment.md):
- *   - MONITOR_INTERVAL          seconds between ticks (default 3600, min 60)
- *   - OWNERSHIP_LOOKUP_TIMEOUT_MS  TXT lookup timeout (default 5000)
- *   - SNAPSHOT_RETENTION        snapshots kept per domain (default 30)
- *
- * Shutdown: SIGINT / SIGTERM finishes the current tick, then exits cleanly.
+ * Shutdown: SIGINT / SIGTERM finishes the current tick, then exits cleanly;
+ * a second signal exits immediately.
  */
 
-import {
-  canSnapshotDomain,
-  getDomainAccess,
-  getDomainStatus,
-  getOwnership,
-  isValidDomain,
-  persistSnapshot,
-} from "@/lib/storage";
-import { createSnapshot } from "@/lib/snapshot";
-import { OWNERSHIP_FAILURE_THRESHOLD, recordOwnershipCheck } from "@/lib/ownership";
-import {
-  loadAlertConfig,
-  processAlerts,
-  type AlertConfig,
-  type CurrentStates,
-} from "@/lib/alerting";
+import { installShutdownHandlers, isStopRequested, runOneTick } from "./tick";
 
 const DEFAULT_INTERVAL_SECONDS = 3600;
 const MIN_INTERVAL_SECONDS = 60;
@@ -57,44 +36,23 @@ function ts(): string {
 }
 
 function log(message: string): void {
-  console.log(`[${ts()}] [monitor] ${message}`);
+  console.log(`[${ts()}] [monitor:loop] ${message}`);
 }
 
 function logError(message: string): void {
-  console.error(`[${ts()}] [monitor] ${message}`);
-}
-
-interface PerDomainStates {
-  ownership: Map<string, string>;
-  stability: Map<string, string>;
-}
-
-let stopRequested = false;
-
-function installShutdownHandlers(): void {
-  const onSignal = (signal: NodeJS.Signals) => {
-    if (stopRequested) {
-      // Second Ctrl-C — bail immediately.
-      logError(`${signal} received again, exiting now`);
-      process.exit(130);
-    }
-    log(`${signal} received — will exit after the current tick completes`);
-    stopRequested = true;
-  };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+  console.error(`[${ts()}] [monitor:loop] ${message}`);
 }
 
 /**
- * Cooperative sleep that wakes every second so a pending shutdown signal
- * can short-circuit the wait. Returns when either the deadline elapses or
- * stopRequested flips true.
+ * Cooperative sleep that wakes every second so a pending shutdown signal can
+ * short-circuit the wait. Returns when either the deadline elapses or
+ * `isStopRequested()` flips true.
  */
 function sleepUntilStoppedOrDeadline(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const start = Date.now();
     const handle = setInterval(() => {
-      if (stopRequested || Date.now() - start >= ms) {
+      if (isStopRequested() || Date.now() - start >= ms) {
         clearInterval(handle);
         resolve();
       }
@@ -102,144 +60,20 @@ function sleepUntilStoppedOrDeadline(ms: number): Promise<void> {
   });
 }
 
-async function runTickForDomain(
-  domain: string,
-  prev: PerDomainStates,
-  alertConfig: AlertConfig,
-): Promise<void> {
-  try {
-    const existing = await getOwnership(domain);
-    if (!existing) {
-      // Defensive: the licensed-active set comes from the store, so an
-      // entry without an ownership record can only happen if state was
-      // hand-edited. Skip and surface.
-      logError(`${domain} has no ownership record — skip (re-add via the API)`);
-      return;
-    }
-
-    // Step 0 — the unconditional proof-of-control gate.
-    const check = await recordOwnershipCheck(domain);
-    const ownershipState = check.ownership.state;
-    const prevOwnership = prev.ownership.get(domain);
-    if (prevOwnership !== ownershipState) {
-      log(
-        `${domain} OWNERSHIP TRANSITION ${prevOwnership ?? "(unknown)"} → ${ownershipState}`,
-      );
-      prev.ownership.set(domain, ownershipState);
-    }
-
-    // Build the alerting "current states" object: ownership is always
-    // observed; stability only when the gate passes.
-    const alertCurrent: CurrentStates = { ownershipState };
-
-    if (!check.result.pass) {
-      const reason = check.result.reason;
-      log(
-        `${domain} ownership=${ownershipState} (${reason}; ${check.ownership.consecutiveFailures}/${OWNERSHIP_FAILURE_THRESHOLD}) → skip`,
-      );
-      await dispatchAndLog(domain, alertCurrent, alertConfig);
-      return;
-    }
-
-    // Step 1 — snapshot + classify.
-    const valid = await isValidDomain(domain);
-    const snapshot = await createSnapshot(domain);
-    if (valid) {
-      await persistSnapshot(domain, snapshot);
-    } else {
-      log(`${domain} resolved invalid — snapshot not persisted`);
-    }
-
-    const status = await getDomainStatus(domain);
-    const stability = status.stability_state ?? status.domain_state;
-    const prevStability = prev.stability.get(domain);
-    if (prevStability !== stability) {
-      log(
-        `${domain} STABILITY TRANSITION ${prevStability ?? "(unknown)"} → ${stability}`,
-      );
-      prev.stability.set(domain, stability);
-    }
-    log(`${domain} ownership=verified stability=${stability}`);
-
-    alertCurrent.stabilityState = stability;
-    await dispatchAndLog(domain, alertCurrent, alertConfig);
-  } catch (error) {
-    logError(`${domain} tick error: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-async function dispatchAndLog(
-  domain: string,
-  current: CurrentStates,
-  alertConfig: AlertConfig,
-): Promise<void> {
-  const result = await processAlerts(domain, current, alertConfig);
-  if (result.initialized) {
-    log(
-      `${domain} alert state initialized (stability=${current.stabilityState ?? "(unobserved)"}, ownership=${current.ownershipState ?? "(unobserved)"})`,
-    );
-    return;
-  }
-  for (const event of result.events) {
-    log(
-      `${domain} ALERT [${event.severity}] ${event.kind}: ${event.from ?? "(unknown)"} → ${event.to}`,
-    );
-  }
-  if (result.dispatched > 0) {
-    log(`${domain} dispatched to ${result.dispatched} channel(s)`);
-  }
-  for (const err of result.errors) {
-    logError(`${domain} alert channel ${err.channel} failed: ${err.error}`);
-  }
-}
-
-async function runTick(prev: PerDomainStates, alertConfig: AlertConfig): Promise<void> {
-  const access = await getDomainAccess();
-  log(
-    `tick start — ${access.active.length} active, ${access.frozen.length} frozen (skipped), license=${access.license.tier ?? "free"}`,
-  );
-
-  for (const domain of access.active) {
-    if (stopRequested) {
-      log("shutdown requested mid-tick — aborting remaining domains");
-      return;
-    }
-    // Re-check capacity per-domain so freshly-frozen domains drop out
-    // immediately if the license changes during a long tick.
-    const capacity = await canSnapshotDomain(domain);
-    if (!capacity.allowed) {
-      log(`${domain} ${capacity.reason} → skip`);
-      continue;
-    }
-    await runTickForDomain(domain, prev, alertConfig);
-  }
-
-  log("tick complete");
-}
-
 async function main(): Promise<void> {
-  const intervalSeconds = resolveIntervalSeconds();
   installShutdownHandlers();
+  const intervalSeconds = resolveIntervalSeconds();
   log(
-    `starting — interval=${intervalSeconds}s, ownership-lookup-timeout=${process.env.OWNERSHIP_LOOKUP_TIMEOUT_MS ?? "5000"}ms, retention=${process.env.SNAPSHOT_RETENTION ?? "30"}`,
+    `starting dev loop — interval=${intervalSeconds}s. For production, schedule \`npm run monitor:tick\` via cron / systemd timer (see docs/deployment.md).`,
   );
 
-  // Alerting config is loaded once at startup; restart the worker to reload
-  // alerts.local.json. Channel-disabled by default — events are computed
-  // and logged either way, but nothing dispatches until the config opts in.
-  const alertConfig = await loadAlertConfig();
-  log(
-    `alerting — email=${alertConfig.channels.email.enabled ? "on" : "off"}, webhook=${alertConfig.channels.webhook.enabled ? "on" : "off"}, severities=${Object.entries(alertConfig.severities).filter(([, v]) => v).map(([k]) => k).join(",") || "(none)"}`,
-  );
-
-  const prev: PerDomainStates = {
-    ownership: new Map(),
-    stability: new Map(),
-  };
-
-  while (!stopRequested) {
-    await runTick(prev, alertConfig);
-    if (stopRequested) break;
+  while (!isStopRequested()) {
+    try {
+      await runOneTick();
+    } catch (error) {
+      logError(`tick error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (isStopRequested()) break;
     log(`sleeping ${intervalSeconds}s`);
     await sleepUntilStoppedOrDeadline(intervalSeconds * 1000);
   }

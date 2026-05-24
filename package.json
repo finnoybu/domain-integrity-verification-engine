@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "monitor": "tsx src/monitor/index.ts"
+    "monitor": "tsx src/monitor/index.ts",
+    "monitor:tick": "tsx src/monitor/tick.ts"
   },
   "dependencies": {
     "next": "16.1.6",
