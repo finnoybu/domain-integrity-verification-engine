@@ -13,7 +13,8 @@ This document defines deployment expectations for Domain Integrity Engine.
 1. Edge DNS and TLS policy via Cloudflare
 2. Reverse proxy via Caddy
 3. Next.js Node application process (`npm start`)
-4. Monitor worker process (`npm run monitor`) running alongside the app
+4. Monitor tick (`npm run monitor:tick`) scheduled via `cron` or a `systemd`
+   timer on the same host
 5. Persistent filesystem for snapshot retention (`data/snapshots`)
 
 ## Required Environment Variables
@@ -23,16 +24,17 @@ This document defines deployment expectations for Domain Integrity Engine.
 - `AUTH_TOKEN=<strong-random-token>`
 - `RATE_LIMIT_ENABLED=true` (recommended)
 
-### Optional — monitor worker
+### Optional — monitor
 
-- `MONITOR_INTERVAL` — seconds between monitor ticks (default `3600`,
-  floor `60`).
 - `OWNERSHIP_LOOKUP_TIMEOUT_MS` — TXT lookup timeout for the
   proof-of-control gate (default `5000`).
 - `SNAPSHOT_RETENTION` — snapshots kept per domain on disk (default `30`,
   floor `2`).
 - `DIVE_LICENSE` — license token, if any. Determines the active-domain
-  capacity the worker iterates each tick.
+  capacity the tick iterates each pass.
+- `MONITOR_INTERVAL` — read only by the dev-loop wrapper (`npm run
+  monitor`); the production scheduler (cron / systemd timer) owns cadence.
+  Default `3600`, floor `60`.
 
 ### Optional — alert email channel
 
@@ -60,33 +62,82 @@ credentials are read from the environment, never the config file.
 - Monitor API status and error rates
 - Keep host and runtime patched
 
-## Monitor Worker
+## Monitor
 
-A separate Node process performs unattended monitoring per
-[monitoring-design.md](monitoring-design.md): every `MONITOR_INTERVAL` seconds
-it runs the ownership check (per
-[ownership-verification-design.md](ownership-verification-design.md)) as step 0
-for each active domain, then — on pass — takes a snapshot and runs the
-stability classifier. Failures tick the three-strikes counter; the third
-consecutive failed check flips state to `ownership_failed`.
+Unattended monitoring runs as a **single-tick** Node process invoked by an
+external scheduler. Each tick walks the licensed-active domains and, per
+[monitoring-design.md](monitoring-design.md) and
+[ownership-verification-design.md](ownership-verification-design.md),
+runs the ownership check as step 0, snapshots on pass, classifies, and
+dispatches alerts on transitions. The process exits at the end of the pass —
+no in-process state survives between ticks (state lives in the store).
 
 ```sh
-npm run monitor
+npm run monitor:tick
 ```
 
-Runs in the foreground, writing time-prefixed log lines to stdout (pipe to
-your log collector / `journald`). It shares the app's filesystem store
-(`data/`), so it must run on the same host as the Next.js process. Graceful
-shutdown: SIGINT / SIGTERM lets the current tick complete, then exits cleanly;
-a second signal exits immediately. Frozen (over-capacity) domains are skipped
-automatically.
+Writes time-prefixed log lines to stdout (pipe to `journald` / your log
+collector). Shares the app's filesystem store (`data/`), so the tick must
+run on the same host as the Next.js process. Exit code `0` on completion
+regardless of per-domain errors (those are logged); `1` on a fatal error.
+Frozen (over-capacity) domains are skipped automatically.
+
+### Scheduling
+
+Pick whatever scheduler the host already runs. Two common patterns:
+
+**cron** — one line, hourly tick:
+
+```cron
+0 * * * * cd /opt/dive && /usr/bin/npm run monitor:tick >> /var/log/dive/monitor.log 2>&1
+```
+
+**systemd timer** — better journald integration:
+
+```ini
+# /etc/systemd/system/dive-monitor.service
+[Unit]
+Description=DIVE monitor tick
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dive
+EnvironmentFile=/opt/dive/.env.production
+ExecStart=/usr/bin/npm run monitor:tick
+
+# /etc/systemd/system/dive-monitor.timer
+[Unit]
+Description=Run DIVE monitor tick hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable with `systemctl enable --now dive-monitor.timer`. Adjust `OnCalendar=`
+(or the cron expression) to match the desired check cadence — DIVE's check
+work has a floor of one minute per domain but is typically scheduled hourly.
+
+### Dev-loop wrapper (not for production)
+
+`npm run monitor` is a thin sleep-loop wrapper that calls `runOneTick`
+repeatedly with a `MONITOR_INTERVAL`-second sleep between passes. It's
+preserved for **local development convenience only** — terminal-watching
+while iterating on monitor or alerting code. Don't use it for production:
+the daemon shape doesn't compose with the per-domain interval overrides
+the dashboard will surface, and a single tick scheduled by the OS is the
+correct architecture (see docs/dashboard-design.md, Monitor architecture).
 
 ### Alerting
 
-State transitions detected by the worker (stability + ownership) fire alerts
-through any channel enabled in `alerts.local.json`. The file is read once at
-worker startup — restart the worker to reload it. Copy `alerts.sample.json`
-to `alerts.local.json` (gitignored, like `ruleset.local.json`) and edit:
+State transitions detected per tick (stability + ownership) fire alerts
+through any channel enabled in `alerts.local.json`. The file is read once
+per tick — config edits take effect on the next scheduled tick. Copy
+`alerts.sample.json` to `alerts.local.json` (gitignored, like
+`ruleset.local.json`) and edit:
 
 ```jsonc
 {
@@ -109,29 +160,24 @@ to `alerts.local.json` (gitignored, like `ruleset.local.json`) and edit:
   invalid / ownership_failed; `warning` for drift; `info` for stable
   recoveries and verified-ownership confirmations.
 - Dedup is persisted per-domain in the store (`lastAlerted`), so transitions
-  alert exactly once and a worker restart does not re-fire alerts for the
-  current state. The first observation of a domain initialises the record
-  silently.
+  alert exactly once and a fresh tick invocation does not re-fire alerts for
+  the current state. The first observation of a domain initialises the
+  record silently.
 
-### Process management (sketch)
+### App process management (sketch)
 
-Run both processes under your supervisor of choice. A minimal systemd pair:
+The Next.js app runs as a long-lived service. A minimal systemd unit:
 
 ```ini
-# dive-app.service — the Next.js app
+# /etc/systemd/system/dive-app.service
 [Service]
 WorkingDirectory=/opt/dive
 EnvironmentFile=/opt/dive/.env.production
 ExecStart=/usr/bin/npm start
 Restart=on-failure
-
-# dive-monitor.service — the unattended monitor
-[Service]
-WorkingDirectory=/opt/dive
-EnvironmentFile=/opt/dive/.env.production
-ExecStart=/usr/bin/npm run monitor
-Restart=on-failure
 ```
+
+The monitor tick is a separate systemd timer — see Scheduling above.
 
 ## Verification
 
