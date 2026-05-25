@@ -4,6 +4,7 @@ import path from "path";
 import tls from "tls";
 import { promises as dns } from "dns";
 import { getLicenseStatus, type LicenseStatus } from "./license";
+import { getDb } from "./db";
 
 export interface DomainSOA {
   primaryNs: string;
@@ -146,13 +147,46 @@ export interface LastAlertedRecord {
   lastAlertedAt: string | null;
 }
 
-interface DomainStore {
-  domains: {
-    [domain: string]: {
-      lastSnapshot: DomainSnapshot;
-      ownership: OwnershipRecord;
-      lastAlerted?: LastAlertedRecord;
-    };
+// The legacy DomainStore in-memory shape (whole-file JSON) is gone — state
+// lives in SQLite via ./db.ts. The per-domain entry below is kept only as an
+// internal type for the SQLite row → object adapter in this module.
+interface DomainRow {
+  name: string;
+  last_snapshot_json: string;
+  ownership_token: string;
+  ownership_state: string;
+  ownership_verified_at: string | null;
+  ownership_failed_at: string | null;
+  ownership_consecutive_failures: number;
+  last_alerted_stability: string | null;
+  last_alerted_ownership: string | null;
+  last_alerted_at: string | null;
+}
+
+function rowToOwnership(row: DomainRow): OwnershipRecord {
+  return {
+    token: row.ownership_token,
+    state: row.ownership_state as OwnershipState,
+    verifiedAt: row.ownership_verified_at,
+    failedAt: row.ownership_failed_at,
+    consecutiveFailures: row.ownership_consecutive_failures,
+  };
+}
+
+function rowToLastAlerted(row: DomainRow): LastAlertedRecord | null {
+  // Treat "no alert ever sent" as null on the way out — matches the
+  // legacy JSON shape where the field was either present or absent.
+  if (
+    row.last_alerted_stability === null &&
+    row.last_alerted_ownership === null &&
+    row.last_alerted_at === null
+  ) {
+    return null;
+  }
+  return {
+    stabilityState: row.last_alerted_stability,
+    ownershipState: row.last_alerted_ownership,
+    lastAlertedAt: row.last_alerted_at,
   };
 }
 
@@ -179,8 +213,6 @@ export function createOwnershipRecord(): OwnershipRecord {
   };
 }
 
-const DATA_FILE = path.join(process.cwd(), "data", "domains.json");
-const SAMPLE_FILE = path.join(process.cwd(), "data", "domains.sample.json");
 /**
  * Snapshots retained per domain. Configurable via the SNAPSHOT_RETENTION
  * environment variable; defaults to 30 (about a month of daily history).
@@ -299,74 +331,6 @@ export function getCanonicalBase(domain: string, timestamp: string = new Date().
   };
 }
 
-async function ensureDataFile() {
-  try {
-    await fs.access(DATA_FILE);
-  } catch {
-    // Runtime datastore does not exist; initialize from sample template
-    await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
-    try {
-      // Attempt to copy from sample template
-      const sampleData = await fs.readFile(SAMPLE_FILE, "utf-8");
-      await fs.writeFile(DATA_FILE, sampleData, "utf-8");
-    } catch {
-      // Fallback: create empty store if sample doesn't exist
-      const defaultStore: DomainStore = { domains: {} };
-      await fs.writeFile(DATA_FILE, JSON.stringify(defaultStore, null, 2), "utf-8");
-    }
-  }
-}
-
-/**
- * Lazy-migrates pre-ownership store entries by minting a fresh ownership
- * record (state: ownership_unverified) for any domain that lacks one. Mutates
- * the input in place and returns true if any entry was migrated, so callers
- * can persist the migrated store back to disk.
- */
-function migrateOwnershipRecords(store: DomainStore): boolean {
-  let migrated = false;
-  for (const domain of Object.keys(store.domains)) {
-    const entry = store.domains[domain] as {
-      lastSnapshot: DomainSnapshot;
-      ownership?: OwnershipRecord;
-    };
-    if (!entry.ownership) {
-      entry.ownership = createOwnershipRecord();
-      migrated = true;
-    }
-  }
-  return migrated;
-}
-
-export async function readStore(): Promise<DomainStore> {
-  try {
-    await ensureDataFile();
-    const data = await fs.readFile(DATA_FILE, "utf-8");
-    const parsed = JSON.parse(data) as DomainStore;
-    if (!parsed.domains) {
-      return { domains: {} };
-    }
-    if (migrateOwnershipRecords(parsed)) {
-      // Persist the migrated store so the token is stable across reads.
-      await writeStore(parsed);
-    }
-    return parsed;
-  } catch (error) {
-    console.error("Error reading store:", error);
-    return { domains: {} };
-  }
-}
-
-export async function writeStore(store: DomainStore): Promise<void> {
-  try {
-    await ensureDataFile();
-    await fs.writeFile(DATA_FILE, JSON.stringify(store, null, 2), "utf-8");
-  } catch (error) {
-    console.error("Error writing store:", error);
-    throw error;
-  }
-}
-
 /**
  * Validates that a snapshot has all required DomainSnapshot keys per v0.0.7 schema.
  * Keys may have undefined values, but the keys themselves must exist.
@@ -387,25 +351,66 @@ function validateSnapshot(snapshot: DomainSnapshot): DomainSnapshot {
   return validatedSnapshot;
 }
 
-export async function addDomain(domain: string, snapshot: DomainSnapshot): Promise<void> {
-  const validatedSnapshot = validateSnapshot(snapshot);
-  const store = await readStore();
-  const existing = store.domains[domain];
-  store.domains[domain] = {
-    ...(existing ?? {}),
-    lastSnapshot: validatedSnapshot,
-    ownership: existing?.ownership ?? createOwnershipRecord(),
-  };
-  await writeStore(store);
+// ----------------------------------------------------------------------------
+// SQLite-backed CRUD. All functions keep their Promise-returning signatures
+// so callers don't need to change; the underlying better-sqlite3 driver is
+// synchronous and we resolve immediately. Async signatures stay forward-
+// compatible with a future host-managed backend (Cloudflare D1, etc.) that
+// would be naturally async — see docs/dashboard-design.md, Hosting.
+// ----------------------------------------------------------------------------
+
+function fetchRow(domain: string): DomainRow | undefined {
+  return getDb()
+    .prepare<[string], DomainRow>("SELECT * FROM domains WHERE name = ?")
+    .get(domain);
 }
 
-export async function updateDomain(domain: string, snapshot: DomainSnapshot): Promise<void> {
-  const validatedSnapshot = validateSnapshot(snapshot);
-  const store = await readStore();
-  if (store.domains[domain]) {
-    store.domains[domain].lastSnapshot = validatedSnapshot;
-    await writeStore(store);
+export async function addDomain(
+  domain: string,
+  snapshot: DomainSnapshot,
+): Promise<void> {
+  const validated = validateSnapshot(snapshot);
+  const db = getDb();
+  const existing = fetchRow(domain);
+  if (existing) {
+    db.prepare(
+      `UPDATE domains
+       SET last_snapshot_json = ?, updated_at = datetime('now')
+       WHERE name = ?`,
+    ).run(JSON.stringify(validated), domain);
+    return;
   }
+
+  const ownership = createOwnershipRecord();
+  db.prepare(
+    `INSERT INTO domains (
+       name, last_snapshot_json,
+       ownership_token, ownership_state,
+       ownership_verified_at, ownership_failed_at, ownership_consecutive_failures
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    domain,
+    JSON.stringify(validated),
+    ownership.token,
+    ownership.state,
+    ownership.verifiedAt,
+    ownership.failedAt,
+    ownership.consecutiveFailures,
+  );
+}
+
+export async function updateDomain(
+  domain: string,
+  snapshot: DomainSnapshot,
+): Promise<void> {
+  const validated = validateSnapshot(snapshot);
+  getDb()
+    .prepare(
+      `UPDATE domains
+       SET last_snapshot_json = ?, updated_at = datetime('now')
+       WHERE name = ?`,
+    )
+    .run(JSON.stringify(validated), domain);
 }
 
 /**
@@ -419,78 +424,110 @@ export async function registerDomain(
   domain: string,
   timestamp: string = new Date().toISOString(),
 ): Promise<OwnershipRecord> {
-  const store = await readStore();
-  const existing = store.domains[domain];
+  const existing = fetchRow(domain);
   if (existing) {
-    return existing.ownership;
+    return rowToOwnership(existing);
   }
 
   const ownership = createOwnershipRecord();
-  store.domains[domain] = {
-    // Placeholder snapshot until the first real fetch — keeps the canonical
-    // schema invariant intact for any reader that hits the store before
-    // ownership is verified.
-    lastSnapshot: getCanonicalBase(domain, timestamp),
-    ownership,
-  };
-  await writeStore(store);
+  getDb()
+    .prepare(
+      `INSERT INTO domains (
+         name, last_snapshot_json,
+         ownership_token, ownership_state,
+         ownership_verified_at, ownership_failed_at, ownership_consecutive_failures
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      domain,
+      // Placeholder snapshot until the first real fetch — keeps the canonical
+      // schema invariant intact for any reader that hits the store before
+      // ownership is verified.
+      JSON.stringify(getCanonicalBase(domain, timestamp)),
+      ownership.token,
+      ownership.state,
+      ownership.verifiedAt,
+      ownership.failedAt,
+      ownership.consecutiveFailures,
+    );
   return ownership;
 }
 
 export async function getOwnership(domain: string): Promise<OwnershipRecord | null> {
-  const store = await readStore();
-  return store.domains[domain]?.ownership ?? null;
+  const row = fetchRow(domain);
+  return row ? rowToOwnership(row) : null;
 }
 
 export async function setOwnership(
   domain: string,
   ownership: OwnershipRecord,
 ): Promise<void> {
-  const store = await readStore();
-  if (!store.domains[domain]) {
-    return;
-  }
-  store.domains[domain].ownership = ownership;
-  await writeStore(store);
+  // Silently no-op for unknown domains — preserves the legacy behavior
+  // where setOwnership on a missing entry was a write to nothing.
+  getDb()
+    .prepare(
+      `UPDATE domains
+       SET ownership_token = ?,
+           ownership_state = ?,
+           ownership_verified_at = ?,
+           ownership_failed_at = ?,
+           ownership_consecutive_failures = ?,
+           updated_at = datetime('now')
+       WHERE name = ?`,
+    )
+    .run(
+      ownership.token,
+      ownership.state,
+      ownership.verifiedAt,
+      ownership.failedAt,
+      ownership.consecutiveFailures,
+      domain,
+    );
 }
 
 export async function getLastAlerted(
   domain: string,
 ): Promise<LastAlertedRecord | null> {
-  const store = await readStore();
-  return store.domains[domain]?.lastAlerted ?? null;
+  const row = fetchRow(domain);
+  return row ? rowToLastAlerted(row) : null;
 }
 
 export async function setLastAlerted(
   domain: string,
   record: LastAlertedRecord,
 ): Promise<void> {
-  const store = await readStore();
-  if (!store.domains[domain]) {
-    return;
-  }
-  store.domains[domain].lastAlerted = record;
-  await writeStore(store);
+  getDb()
+    .prepare(
+      `UPDATE domains
+       SET last_alerted_stability = ?,
+           last_alerted_ownership = ?,
+           last_alerted_at = ?,
+           updated_at = datetime('now')
+       WHERE name = ?`,
+    )
+    .run(record.stabilityState, record.ownershipState, record.lastAlertedAt, domain);
 }
 
 export async function deleteDomain(domain: string): Promise<boolean> {
-  const store = await readStore();
-  if (store.domains[domain]) {
-    delete store.domains[domain];
-    await writeStore(store);
-    return true;
-  }
-  return false;
+  const result = getDb().prepare("DELETE FROM domains WHERE name = ?").run(domain);
+  return result.changes > 0;
 }
 
 export async function getDomains(): Promise<string[]> {
-  const store = await readStore();
-  return Object.keys(store.domains);
+  // ORDER BY rowid ASC preserves insertion order, matching the legacy JSON
+  // store's object-key-iteration semantics. The license capacity layer
+  // depends on this ordering (earliest-added domains stay active when the
+  // license shrinks; later ones freeze).
+  return getDb()
+    .prepare<[], { name: string }>("SELECT name FROM domains ORDER BY rowid ASC")
+    .all()
+    .map((r) => r.name);
 }
 
 export async function getDomainSnapshot(domain: string): Promise<DomainSnapshot | null> {
-  const store = await readStore();
-  return store.domains[domain]?.lastSnapshot || null;
+  const row = fetchRow(domain);
+  if (!row) return null;
+  return JSON.parse(row.last_snapshot_json) as DomainSnapshot;
 }
 
 // ============================================================================
@@ -613,25 +650,44 @@ async function enforceSnapshotRetention(domain: string): Promise<void> {
  */
 export async function persistSnapshot(domain: string, snapshot: DomainSnapshot): Promise<string> {
   const validatedSnapshot = validateSnapshot(snapshot);
-  
-  // Write to disk with atomic rename
+
+  // Write the full blob to disk with atomic rename. Snapshot files are large
+  // append-mostly artifacts — they stay on the filesystem; only the
+  // last-snapshot cache lives in SQLite for fast dashboard reads.
   const filepath = await atomicWriteSnapshot(domain, validatedSnapshot);
-  
-  // Enforce retention policy in one place
+
   await enforceSnapshotRetention(domain);
-  
-  // Also update the legacy store for backward compatibility.
-  // Preserve the existing ownership record (lazy migration in readStore
-  // ensures one exists; mint a fresh one defensively if not) and any other
-  // auxiliary fields (lastAlerted, etc.).
-  const store = await readStore();
-  const existing = store.domains[domain];
-  store.domains[domain] = {
-    ...(existing ?? {}),
-    lastSnapshot: validatedSnapshot,
-    ownership: existing?.ownership ?? createOwnershipRecord(),
-  };
-  await writeStore(store);
+
+  // Refresh the SQLite last-snapshot cache. If the domain row does not yet
+  // exist (someone called persistSnapshot for an unregistered domain — only
+  // the migration script and tests do this), mint an ownership record so the
+  // row is fully populated.
+  const db = getDb();
+  const existing = fetchRow(domain);
+  if (existing) {
+    db.prepare(
+      `UPDATE domains
+       SET last_snapshot_json = ?, updated_at = datetime('now')
+       WHERE name = ?`,
+    ).run(JSON.stringify(validatedSnapshot), domain);
+  } else {
+    const ownership = createOwnershipRecord();
+    db.prepare(
+      `INSERT INTO domains (
+         name, last_snapshot_json,
+         ownership_token, ownership_state,
+         ownership_verified_at, ownership_failed_at, ownership_consecutive_failures
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      domain,
+      JSON.stringify(validatedSnapshot),
+      ownership.token,
+      ownership.state,
+      ownership.verifiedAt,
+      ownership.failedAt,
+      ownership.consecutiveFailures,
+    );
+  }
 
   return filepath;
 }
