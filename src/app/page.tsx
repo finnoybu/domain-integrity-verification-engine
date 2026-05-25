@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { DomainSnapshot } from "@/lib/storage";
+import { Button } from "@/components/ui/button";
 
 type OwnershipState =
   | "ownership_unverified"
@@ -625,40 +626,25 @@ export default function Home() {
                 </div>
               )}
 
-              <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
-                <button
+              {/* PR 1 sanity test — these two buttons port to the shadcn
+                  Button primitive while the rest of the page still uses
+                  inline styles. PR 4 restructures the dashboard and
+                  retires the inline-style era wholesale. */}
+              <div className="flex flex-wrap gap-3">
+                <Button
+                  size="lg"
                   onClick={() => handleVerifyDomain(selectedDomain)}
                   disabled={loading}
-                  style={{
-                    padding: "0.625rem 1.25rem",
-                    backgroundColor: "#059669",
-                    color: "white",
-                    border: "none",
-                    borderRadius: 6,
-                    cursor: loading ? "not-allowed" : "pointer",
-                    fontWeight: 500,
-                    fontSize: "0.95rem",
-                    opacity: loading ? 0.7 : 1,
-                  }}
                 >
                   {loading ? "Verifying..." : "Verify"}
-                </button>
-                <button
+                </Button>
+                <Button
+                  size="lg"
+                  variant={copiedToken === selectedDomainData.ownership!.token ? "secondary" : "outline"}
                   onClick={() => handleCopyToken(selectedDomainData.ownership!.token)}
-                  style={{
-                    padding: "0.625rem 1.25rem",
-                    backgroundColor: copiedToken === selectedDomainData.ownership!.token ? "#d1fae5" : "#f3f4f6",
-                    color: copiedToken === selectedDomainData.ownership!.token ? "#065f46" : "#111827",
-                    border: `1px solid ${copiedToken === selectedDomainData.ownership!.token ? "#a7f3d0" : "#d1d5db"}`,
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    fontWeight: 500,
-                    fontSize: "0.95rem",
-                    transition: "background-color 150ms ease, color 150ms ease, border-color 150ms ease",
-                  }}
                 >
                   {copiedToken === selectedDomainData.ownership!.token ? "Copied!" : "Copy token"}
-                </button>
+                </Button>
               </div>
             </div>
           )}
