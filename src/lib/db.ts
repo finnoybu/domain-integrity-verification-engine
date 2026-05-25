@@ -27,7 +27,7 @@ const DB_FILE = path.join(DATA_DIR, "dive.db");
 const LEGACY_JSON = path.join(DATA_DIR, "domains.json");
 const LEGACY_JSON_IMPORTED = path.join(DATA_DIR, "domains.json.imported");
 
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 let cached: BetterSqlite3Database | null = null;
 
@@ -70,6 +70,8 @@ export function closeDb(): void {
 }
 
 function initSchema(db: BetterSqlite3Database): void {
+  // Baseline tables — every supported version has these. CREATE IF NOT EXISTS
+  // makes initSchema idempotent across both fresh-DB and existing-DB boots.
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_meta (
       key TEXT PRIMARY KEY,
@@ -95,18 +97,102 @@ function initSchema(db: BetterSqlite3Database): void {
       ON domains(ownership_state);
   `);
 
-  // Track schema version so future migrations can run conditionally.
-  const stored = db
-    .prepare<[], { value: string }>("SELECT value FROM schema_meta WHERE key = 'version'")
+  runMigrations(db);
+}
+
+function getStoredVersion(db: BetterSqlite3Database): number {
+  const row = db
+    .prepare<[], { value: string }>(
+      "SELECT value FROM schema_meta WHERE key = 'version'",
+    )
     .get();
-  if (!stored) {
-    db.prepare("INSERT INTO schema_meta(key, value) VALUES ('version', ?)").run(
-      String(CURRENT_SCHEMA_VERSION),
-    );
+  return row ? Number(row.value) : 0;
+}
+
+function setStoredVersion(db: BetterSqlite3Database, version: number): void {
+  db.prepare(
+    `INSERT INTO schema_meta(key, value) VALUES ('version', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(String(version));
+}
+
+/**
+ * Walks the migration ladder from the on-disk schema version up to
+ * `CURRENT_SCHEMA_VERSION`. Each step is wrapped in a transaction so a partial
+ * failure leaves the DB at its previous version — the next boot retries cleanly.
+ *
+ * Adding a new schema version: bump `CURRENT_SCHEMA_VERSION`, add an
+ * `if (current < N)` block here that creates / alters tables and ends with
+ * `setStoredVersion(db, N)`.
+ */
+function runMigrations(db: BetterSqlite3Database): void {
+  const current = getStoredVersion(db);
+
+  if (current < 1) {
+    // v1 is the baseline shape created by initSchema above — nothing to do
+    // beyond stamping the version on a fresh DB.
+    setStoredVersion(db, 1);
   }
-  // No upgrades yet — version 1 is the initial schema. When a v2 lands,
-  // gate the migration here on `stored.value !== '2'`, run the upgrade,
-  // UPDATE schema_meta.
+
+  if (current < 2) {
+    // v2 — auth surface for the v0.3.0 dashboard:
+    //   users          one row per operator with sign-in access
+    //   sessions       opaque cookie tokens, server-side; 30-day sliding TTL
+    //   magic_links    single-use email tokens, 15-minute TTL
+    //   api_tokens     replaces the single shared AUTH_TOKEN env path; each
+    //                  row is per-user, named, revocable. Token plaintext is
+    //                  never stored — only its SHA-256 hash.
+    //
+    // All token columns store SHA-256 hashes of 256-bit random secrets. At
+    // that entropy a generic hash is sufficient; bcrypt would only add cost
+    // without buying us anything against a stolen DB file.
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL UNIQUE,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_signed_in_at TEXT
+        );
+
+        CREATE TABLE sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          last_used_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+        CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+
+        CREATE TABLE magic_links (
+          token_hash TEXT PRIMARY KEY,
+          email TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT
+        );
+        CREATE INDEX idx_magic_links_email ON magic_links(email);
+        CREATE INDEX idx_magic_links_expires_at ON magic_links(expires_at);
+
+        CREATE TABLE api_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token_hash TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          revoked_at TEXT
+        );
+        CREATE INDEX idx_api_tokens_user_id ON api_tokens(user_id);
+      `);
+      setStoredVersion(db, 2);
+    })();
+  }
+
+  // Future migrations append here. Don't ever re-order an existing block.
+  void CURRENT_SCHEMA_VERSION;
 }
 
 interface LegacyOwnership {
