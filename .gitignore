@@ -38,6 +38,11 @@ yarn-error.log*
 
 # runtime data (never commit snapshots or local state)
 data/domains.json
+data/domains.json.imported*
+data/domains.json.backup*
+data/dive.db
+data/dive.db-shm
+data/dive.db-wal
 data/snapshots/
 *.local.json
 ruleset.json
