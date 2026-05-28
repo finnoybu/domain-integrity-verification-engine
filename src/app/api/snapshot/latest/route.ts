@@ -8,6 +8,7 @@ import {
   logServerError,
   notFound,
 } from "@/lib/api-helpers";
+import { requireAuth } from "@/lib/auth-server";
 
 export async function GET(request: NextRequest) {
   const requestId = getRequestId();
@@ -15,6 +16,11 @@ export async function GET(request: NextRequest) {
   const rateLimited = enforceRateLimit(request, requestId);
   if (rateLimited) {
     return rateLimited;
+  }
+
+  const auth = requireAuth(request);
+  if (!auth.ok) {
+    return auth.response;
   }
 
   try {

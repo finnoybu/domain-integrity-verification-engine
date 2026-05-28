@@ -1,5 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { SESSION_COOKIE_NAME } from "./auth";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import {
+  SESSION_COOKIE_NAME,
+  getSession,
+  verifyApiToken,
+  type SessionInfo,
+} from "./auth";
+import { authRequired } from "./api-helpers";
 
 // ============================================================================
 // Next.js-coupled auth glue: session cookie read/write/clear and base-URL
@@ -69,4 +77,67 @@ export function clearSessionCookie(response: NextResponse): void {
     path: "/",
     maxAge: 0,
   });
+}
+
+// ----------------------------------------------------------------------------
+// Authoritative, DB-backed auth checks. These run on the Node runtime (route
+// handlers and server components) — unlike the Edge proxy.ts backstop, which
+// can only inspect credential presence.
+// ----------------------------------------------------------------------------
+
+export interface AuthedActor {
+  userId: number;
+  /** Which credential authenticated the request. */
+  via: "session" | "api_token";
+}
+
+export type RequireAuthResult =
+  | { ok: true; actor: AuthedActor }
+  | { ok: false; response: NextResponse };
+
+/**
+ * API-route auth gate. Accepts EITHER an `Authorization: Bearer <token>`
+ * matching an active api_tokens row (integrations, scripts) OR a valid session
+ * cookie (the dashboard's own fetch calls). Returns the authenticated actor or
+ * a ready-to-return 401.
+ *
+ *   const auth = requireAuth(request);
+ *   if (!auth.ok) return auth.response;
+ *   // ... auth.actor.userId
+ */
+export function requireAuth(request: NextRequest): RequireAuthResult {
+  const authorization = request.headers.get("authorization");
+  if (authorization?.startsWith("Bearer ")) {
+    const token = authorization.slice("Bearer ".length).trim();
+    const verified = verifyApiToken(token);
+    if (verified) {
+      return { ok: true, actor: { userId: verified.userId, via: "api_token" } };
+    }
+    // A presented-but-invalid bearer token is an explicit failure — don't fall
+    // through to cookie auth for an API client that meant to use a token.
+    return { ok: false, response: authRequired() };
+  }
+
+  const session = getSession(request.cookies.get(SESSION_COOKIE_NAME)?.value);
+  if (session) {
+    return { ok: true, actor: { userId: session.user.id, via: "session" } };
+  }
+
+  return { ok: false, response: authRequired() };
+}
+
+/**
+ * Server-component page guard. Validates the session cookie and redirects to
+ * /login when absent or invalid. Returns the live session on success so the
+ * page can render user-aware chrome.
+ *
+ *   const { user } = await requirePageSession();
+ */
+export async function requirePageSession(): Promise<SessionInfo> {
+  const store = await cookies();
+  const session = getSession(store.get(SESSION_COOKIE_NAME)?.value);
+  if (!session) {
+    redirect("/login");
+  }
+  return session;
 }
