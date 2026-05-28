@@ -22,10 +22,24 @@ import path from "path";
 // always possible.
 // ============================================================================
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DATA_DIR, "dive.db");
-const LEGACY_JSON = path.join(DATA_DIR, "domains.json");
-const LEGACY_JSON_IMPORTED = path.join(DATA_DIR, "domains.json.imported");
+// Data directory is resolvable via DIVE_DATA_DIR so tests and one-shot
+// scripts can run against an isolated DB instead of the production
+// data/dive.db. Defaults to <cwd>/data (the production layout). Resolved at
+// getDb() time, not import time, so a test can set the env var before first
+// use.
+function diveDataDir(): string {
+  const override = process.env.DIVE_DATA_DIR;
+  return override ? path.resolve(override) : path.join(process.cwd(), "data");
+}
+function dbFile(): string {
+  return path.join(diveDataDir(), "dive.db");
+}
+function legacyJsonPath(): string {
+  return path.join(diveDataDir(), "domains.json");
+}
+function legacyJsonImportedPath(): string {
+  return path.join(diveDataDir(), "domains.json.imported");
+}
 
 const CURRENT_SCHEMA_VERSION = 2;
 
@@ -40,8 +54,8 @@ let cached: BetterSqlite3Database | null = null;
 export function getDb(): BetterSqlite3Database {
   if (cached) return cached;
 
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const db = new Database(DB_FILE);
+  fs.mkdirSync(diveDataDir(), { recursive: true });
+  const db = new Database(dbFile());
 
   // WAL is the right journal mode for a workload with one writer per process
   // (web app, monitor tick) and many concurrent readers — and the monitor
@@ -53,9 +67,39 @@ export function getDb(): BetterSqlite3Database {
 
   initSchema(db);
   importLegacyJsonIfPresent(db);
+  bootstrapAdminFromEnv(db);
 
   cached = db;
   return db;
+}
+
+/**
+ * Seeds the first admin user from `ADMIN_BOOTSTRAP_EMAIL` on first boot, as
+ * decided in docs/dashboard-design.md (matches the env-config pattern used by
+ * SMTP / license / retention). Runs once at DB-handle creation; subsequent
+ * boots find the user already present and no-op.
+ *
+ * Lives in db.ts rather than auth.ts to avoid a circular import (auth.ts
+ * depends on db.ts for getDb). The seed itself is a single INSERT and stays
+ * scoped to first run by the users-empty guard.
+ */
+function bootstrapAdminFromEnv(db: BetterSqlite3Database): void {
+  const raw = (process.env.ADMIN_BOOTSTRAP_EMAIL ?? "").trim().toLowerCase();
+  if (!raw) return;
+  // Guard against typoed values that would create unusable rows.
+  if (!raw.includes("@") || raw.includes(" ")) {
+    console.warn(
+      `[auth] ADMIN_BOOTSTRAP_EMAIL='${raw}' does not look like an email — skipping bootstrap`,
+    );
+    return;
+  }
+  const existing = db
+    .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM users")
+    .get();
+  if (existing && existing.c > 0) return;
+
+  db.prepare(`INSERT INTO users (email, is_admin) VALUES (?, 1)`).run(raw);
+  console.log(`[auth] seeded bootstrap admin from ADMIN_BOOTSTRAP_EMAIL: ${raw}`);
 }
 
 /**
@@ -192,7 +236,16 @@ function runMigrations(db: BetterSqlite3Database): void {
   }
 
   // Future migrations append here. Don't ever re-order an existing block.
-  void CURRENT_SCHEMA_VERSION;
+
+  // Invariant: every supported version's migration ran; the stored version now
+  // equals the code's CURRENT_SCHEMA_VERSION. A mismatch means a migration
+  // block is missing for a version the code claims to support.
+  const finalVersion = getStoredVersion(db);
+  if (finalVersion !== CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `[db] migration ladder incomplete: stored version ${finalVersion} != code version ${CURRENT_SCHEMA_VERSION}`,
+    );
+  }
 }
 
 interface LegacyOwnership {
@@ -229,6 +282,7 @@ interface LegacyDomainStore {
  * file is left untouched, so a retry sees the same starting condition.
  */
 function importLegacyJsonIfPresent(db: BetterSqlite3Database): void {
+  const LEGACY_JSON = legacyJsonPath();
   if (!fs.existsSync(LEGACY_JSON)) return;
 
   // Guard against re-import: only migrate when the table is empty. A
@@ -329,6 +383,8 @@ function importLegacyJsonIfPresent(db: BetterSqlite3Database): void {
 }
 
 function archiveLegacyJson(): void {
+  const LEGACY_JSON = legacyJsonPath();
+  const LEGACY_JSON_IMPORTED = legacyJsonImportedPath();
   try {
     // If a prior partial run left a stale .imported, rotate it so the
     // current archive is the most recent one.
