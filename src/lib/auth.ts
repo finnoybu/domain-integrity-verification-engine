@@ -1,6 +1,12 @@
 import crypto from "crypto";
 import { getDb } from "./db";
 import { sendEmail } from "./email";
+import { SESSION_COOKIE_NAME } from "./auth-constants";
+
+// Re-export so existing importers (auth-server.ts) keep `import {
+// SESSION_COOKIE_NAME } from "./auth"` working; the canonical definition lives
+// in the Edge-safe auth-constants module.
+export { SESSION_COOKIE_NAME };
 
 // ============================================================================
 // Auth — magic-link sign-in, server-side sessions, API tokens.
@@ -14,8 +20,6 @@ import { sendEmail } from "./email";
 // the migration ladder; this module assumes the users table is already
 // reachable.
 // ============================================================================
-
-export const SESSION_COOKIE_NAME = "dive_session";
 
 /** 30-day session lifetime; renewed (sliding) on every successful getSession. */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -151,13 +155,6 @@ export async function issueMagicLink(
     return { ok: true, sent: false };
   }
 
-  const from = process.env.DIVE_AUTH_FROM;
-  if (!from) {
-    throw new Error(
-      "DIVE_AUTH_FROM is not set; magic-link sign-in cannot send mail. Set it to the address you want sign-in links sent from (and ensure DIVE_SMTP_* are configured).",
-    );
-  }
-
   const plaintext = randomToken();
   const tokenHash = hashToken(plaintext);
   const expiresAt = new Date(Date.now() + MAGIC_LINK_TTL_MS).toISOString();
@@ -169,6 +166,26 @@ export async function issueMagicLink(
     .run(tokenHash, normalized, expiresAt);
 
   const link = `${baseUrl.replace(/\/$/, "")}/auth/verify?token=${encodeURIComponent(plaintext)}`;
+
+  // Local-dev convenience: DIVE_AUTH_DEV_ECHO=true prints the link to the
+  // server console so a developer can sign in without an SMTP server. Opt-in
+  // and never implied by NODE_ENV, so it can't silently leak links in prod
+  // logs. With it on, a missing DIVE_AUTH_FROM is non-fatal (no send needed).
+  const devEcho = process.env.DIVE_AUTH_DEV_ECHO === "true";
+  if (devEcho) {
+    console.log(`[auth][dev] magic-link sign-in URL for ${normalized}: ${link}`);
+  }
+
+  const from = process.env.DIVE_AUTH_FROM;
+  if (!from) {
+    if (devEcho) {
+      // The link was echoed to the console; treat as delivered.
+      return { ok: true, sent: true };
+    }
+    throw new Error(
+      "DIVE_AUTH_FROM is not set; magic-link sign-in cannot send mail. Set it to the address you want sign-in links sent from (and ensure DIVE_SMTP_* are configured), or set DIVE_AUTH_DEV_ECHO=true for local development.",
+    );
+  }
 
   await sendEmail({
     from,

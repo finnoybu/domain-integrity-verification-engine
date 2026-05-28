@@ -1,4 +1,5 @@
 import Database, { type Database as BetterSqlite3Database } from "better-sqlite3";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -68,6 +69,7 @@ export function getDb(): BetterSqlite3Database {
   initSchema(db);
   importLegacyJsonIfPresent(db);
   bootstrapAdminFromEnv(db);
+  adoptLegacyAuthTokenIfPresent(db);
 
   cached = db;
   return db;
@@ -100,6 +102,51 @@ function bootstrapAdminFromEnv(db: BetterSqlite3Database): void {
 
   db.prepare(`INSERT INTO users (email, is_admin) VALUES (?, 1)`).run(raw);
   console.log(`[auth] seeded bootstrap admin from ADMIN_BOOTSTRAP_EMAIL: ${raw}`);
+}
+
+/**
+ * v0.3.0 upgrade path: adopt an existing `AUTH_TOKEN` env value into the
+ * api_tokens table on first boot so installs that used the old single-shared
+ * bearer token keep working with zero env churn (the operator's monitor cron /
+ * integrations keep sending the same `Authorization: Bearer <AUTH_TOKEN>`).
+ *
+ * The plaintext is hashed with the same SHA-256 form verifyApiToken uses, so a
+ * request bearing the original token matches the adopted row. The legacy token
+ * has no `dive_pat_` prefix — verifyApiToken doesn't require one. Operators can
+ * rotate it via the dashboard / mint-api-token CLI whenever convenient.
+ *
+ * Runs once: guarded by an empty api_tokens table (first-run signal). Requires
+ * an admin to attach to — bootstrapAdminFromEnv must have run first. Inlined
+ * here (rather than calling auth.ts) to avoid an auth↔db import cycle.
+ */
+function adoptLegacyAuthTokenIfPresent(db: BetterSqlite3Database): void {
+  const legacy = process.env.AUTH_TOKEN;
+  if (!legacy) return;
+
+  const tokenCount = db
+    .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM api_tokens")
+    .get();
+  if (tokenCount && tokenCount.c > 0) return;
+
+  const admin = db
+    .prepare<[], { id: number }>(
+      "SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1",
+    )
+    .get();
+  if (!admin) {
+    console.warn(
+      "[auth] AUTH_TOKEN is set but no admin user exists to adopt it — set ADMIN_BOOTSTRAP_EMAIL, or mint a token with `npx tsx scripts/mint-api-token.ts` once a user exists.",
+    );
+    return;
+  }
+
+  const tokenHash = crypto.createHash("sha256").update(legacy).digest("hex");
+  db.prepare(
+    `INSERT INTO api_tokens (token_hash, user_id, name) VALUES (?, ?, ?)`,
+  ).run(tokenHash, admin.id, "legacy AUTH_TOKEN (adopted on upgrade)");
+  console.log(
+    "[auth] adopted existing AUTH_TOKEN into api_tokens — existing Bearer integrations keep working. Rotate it from the dashboard or CLI when convenient.",
+  );
 }
 
 /**
