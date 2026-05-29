@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "eslint",
     "monitor": "tsx src/monitor/index.ts",
-    "monitor:tick": "tsx src/monitor/tick.ts"
+    "monitor:tick": "tsx src/monitor/tick.ts",
+    "token": "tsx scripts/mint-api-token.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",

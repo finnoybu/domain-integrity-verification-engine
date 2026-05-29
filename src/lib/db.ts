@@ -1,4 +1,5 @@
 import Database, { type Database as BetterSqlite3Database } from "better-sqlite3";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -22,12 +23,26 @@ import path from "path";
 // always possible.
 // ============================================================================
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DATA_DIR, "dive.db");
-const LEGACY_JSON = path.join(DATA_DIR, "domains.json");
-const LEGACY_JSON_IMPORTED = path.join(DATA_DIR, "domains.json.imported");
+// Data directory is resolvable via DIVE_DATA_DIR so tests and one-shot
+// scripts can run against an isolated DB instead of the production
+// data/dive.db. Defaults to <cwd>/data (the production layout). Resolved at
+// getDb() time, not import time, so a test can set the env var before first
+// use.
+function diveDataDir(): string {
+  const override = process.env.DIVE_DATA_DIR;
+  return override ? path.resolve(override) : path.join(process.cwd(), "data");
+}
+function dbFile(): string {
+  return path.join(diveDataDir(), "dive.db");
+}
+function legacyJsonPath(): string {
+  return path.join(diveDataDir(), "domains.json");
+}
+function legacyJsonImportedPath(): string {
+  return path.join(diveDataDir(), "domains.json.imported");
+}
 
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 let cached: BetterSqlite3Database | null = null;
 
@@ -40,8 +55,8 @@ let cached: BetterSqlite3Database | null = null;
 export function getDb(): BetterSqlite3Database {
   if (cached) return cached;
 
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const db = new Database(DB_FILE);
+  fs.mkdirSync(diveDataDir(), { recursive: true });
+  const db = new Database(dbFile());
 
   // WAL is the right journal mode for a workload with one writer per process
   // (web app, monitor tick) and many concurrent readers — and the monitor
@@ -53,9 +68,85 @@ export function getDb(): BetterSqlite3Database {
 
   initSchema(db);
   importLegacyJsonIfPresent(db);
+  bootstrapAdminFromEnv(db);
+  adoptLegacyAuthTokenIfPresent(db);
 
   cached = db;
   return db;
+}
+
+/**
+ * Seeds the first admin user from `ADMIN_BOOTSTRAP_EMAIL` on first boot, as
+ * decided in docs/dashboard-design.md (matches the env-config pattern used by
+ * SMTP / license / retention). Runs once at DB-handle creation; subsequent
+ * boots find the user already present and no-op.
+ *
+ * Lives in db.ts rather than auth.ts to avoid a circular import (auth.ts
+ * depends on db.ts for getDb). The seed itself is a single INSERT and stays
+ * scoped to first run by the users-empty guard.
+ */
+function bootstrapAdminFromEnv(db: BetterSqlite3Database): void {
+  const raw = (process.env.ADMIN_BOOTSTRAP_EMAIL ?? "").trim().toLowerCase();
+  if (!raw) return;
+  // Guard against typoed values that would create unusable rows.
+  if (!raw.includes("@") || raw.includes(" ")) {
+    console.warn(
+      `[auth] ADMIN_BOOTSTRAP_EMAIL='${raw}' does not look like an email — skipping bootstrap`,
+    );
+    return;
+  }
+  const existing = db
+    .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM users")
+    .get();
+  if (existing && existing.c > 0) return;
+
+  db.prepare(`INSERT INTO users (email, is_admin) VALUES (?, 1)`).run(raw);
+  console.log(`[auth] seeded bootstrap admin from ADMIN_BOOTSTRAP_EMAIL: ${raw}`);
+}
+
+/**
+ * v0.3.0 upgrade path: adopt an existing `AUTH_TOKEN` env value into the
+ * api_tokens table on first boot so installs that used the old single-shared
+ * bearer token keep working with zero env churn (the operator's monitor cron /
+ * integrations keep sending the same `Authorization: Bearer <AUTH_TOKEN>`).
+ *
+ * The plaintext is hashed with the same SHA-256 form verifyApiToken uses, so a
+ * request bearing the original token matches the adopted row. The legacy token
+ * has no `dive_pat_` prefix — verifyApiToken doesn't require one. Operators can
+ * rotate it via the dashboard / mint-api-token CLI whenever convenient.
+ *
+ * Runs once: guarded by an empty api_tokens table (first-run signal). Requires
+ * an admin to attach to — bootstrapAdminFromEnv must have run first. Inlined
+ * here (rather than calling auth.ts) to avoid an auth↔db import cycle.
+ */
+function adoptLegacyAuthTokenIfPresent(db: BetterSqlite3Database): void {
+  const legacy = process.env.AUTH_TOKEN;
+  if (!legacy) return;
+
+  const tokenCount = db
+    .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM api_tokens")
+    .get();
+  if (tokenCount && tokenCount.c > 0) return;
+
+  const admin = db
+    .prepare<[], { id: number }>(
+      "SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1",
+    )
+    .get();
+  if (!admin) {
+    console.warn(
+      "[auth] AUTH_TOKEN is set but no admin user exists to adopt it — set ADMIN_BOOTSTRAP_EMAIL, or mint a token with `npx tsx scripts/mint-api-token.ts` once a user exists.",
+    );
+    return;
+  }
+
+  const tokenHash = crypto.createHash("sha256").update(legacy).digest("hex");
+  db.prepare(
+    `INSERT INTO api_tokens (token_hash, user_id, name) VALUES (?, ?, ?)`,
+  ).run(tokenHash, admin.id, "legacy AUTH_TOKEN (adopted on upgrade)");
+  console.log(
+    "[auth] adopted existing AUTH_TOKEN into api_tokens — existing Bearer integrations keep working. Rotate it from the dashboard or CLI when convenient.",
+  );
 }
 
 /**
@@ -70,6 +161,8 @@ export function closeDb(): void {
 }
 
 function initSchema(db: BetterSqlite3Database): void {
+  // Baseline tables — every supported version has these. CREATE IF NOT EXISTS
+  // makes initSchema idempotent across both fresh-DB and existing-DB boots.
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_meta (
       key TEXT PRIMARY KEY,
@@ -95,18 +188,111 @@ function initSchema(db: BetterSqlite3Database): void {
       ON domains(ownership_state);
   `);
 
-  // Track schema version so future migrations can run conditionally.
-  const stored = db
-    .prepare<[], { value: string }>("SELECT value FROM schema_meta WHERE key = 'version'")
+  runMigrations(db);
+}
+
+function getStoredVersion(db: BetterSqlite3Database): number {
+  const row = db
+    .prepare<[], { value: string }>(
+      "SELECT value FROM schema_meta WHERE key = 'version'",
+    )
     .get();
-  if (!stored) {
-    db.prepare("INSERT INTO schema_meta(key, value) VALUES ('version', ?)").run(
-      String(CURRENT_SCHEMA_VERSION),
+  return row ? Number(row.value) : 0;
+}
+
+function setStoredVersion(db: BetterSqlite3Database, version: number): void {
+  db.prepare(
+    `INSERT INTO schema_meta(key, value) VALUES ('version', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(String(version));
+}
+
+/**
+ * Walks the migration ladder from the on-disk schema version up to
+ * `CURRENT_SCHEMA_VERSION`. Each step is wrapped in a transaction so a partial
+ * failure leaves the DB at its previous version — the next boot retries cleanly.
+ *
+ * Adding a new schema version: bump `CURRENT_SCHEMA_VERSION`, add an
+ * `if (current < N)` block here that creates / alters tables and ends with
+ * `setStoredVersion(db, N)`.
+ */
+function runMigrations(db: BetterSqlite3Database): void {
+  const current = getStoredVersion(db);
+
+  if (current < 1) {
+    // v1 is the baseline shape created by initSchema above — nothing to do
+    // beyond stamping the version on a fresh DB.
+    setStoredVersion(db, 1);
+  }
+
+  if (current < 2) {
+    // v2 — auth surface for the v0.3.0 dashboard:
+    //   users          one row per operator with sign-in access
+    //   sessions       opaque cookie tokens, server-side; 30-day sliding TTL
+    //   magic_links    single-use email tokens, 15-minute TTL
+    //   api_tokens     replaces the single shared AUTH_TOKEN env path; each
+    //                  row is per-user, named, revocable. Token plaintext is
+    //                  never stored — only its SHA-256 hash.
+    //
+    // All token columns store SHA-256 hashes of 256-bit random secrets. At
+    // that entropy a generic hash is sufficient; bcrypt would only add cost
+    // without buying us anything against a stolen DB file.
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL UNIQUE,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_signed_in_at TEXT
+        );
+
+        CREATE TABLE sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          last_used_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+        CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+
+        CREATE TABLE magic_links (
+          token_hash TEXT PRIMARY KEY,
+          email TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT
+        );
+        CREATE INDEX idx_magic_links_email ON magic_links(email);
+        CREATE INDEX idx_magic_links_expires_at ON magic_links(expires_at);
+
+        CREATE TABLE api_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token_hash TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          revoked_at TEXT
+        );
+        CREATE INDEX idx_api_tokens_user_id ON api_tokens(user_id);
+      `);
+      setStoredVersion(db, 2);
+    })();
+  }
+
+  // Future migrations append here. Don't ever re-order an existing block.
+
+  // Invariant: every supported version's migration ran; the stored version now
+  // equals the code's CURRENT_SCHEMA_VERSION. A mismatch means a migration
+  // block is missing for a version the code claims to support.
+  const finalVersion = getStoredVersion(db);
+  if (finalVersion !== CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `[db] migration ladder incomplete: stored version ${finalVersion} != code version ${CURRENT_SCHEMA_VERSION}`,
     );
   }
-  // No upgrades yet — version 1 is the initial schema. When a v2 lands,
-  // gate the migration here on `stored.value !== '2'`, run the upgrade,
-  // UPDATE schema_meta.
 }
 
 interface LegacyOwnership {
@@ -143,6 +329,7 @@ interface LegacyDomainStore {
  * file is left untouched, so a retry sees the same starting condition.
  */
 function importLegacyJsonIfPresent(db: BetterSqlite3Database): void {
+  const LEGACY_JSON = legacyJsonPath();
   if (!fs.existsSync(LEGACY_JSON)) return;
 
   // Guard against re-import: only migrate when the table is empty. A
@@ -243,6 +430,8 @@ function importLegacyJsonIfPresent(db: BetterSqlite3Database): void {
 }
 
 function archiveLegacyJson(): void {
+  const LEGACY_JSON = legacyJsonPath();
+  const LEGACY_JSON_IMPORTED = legacyJsonImportedPath();
   try {
     // If a prior partial run left a stale .imported, rotate it so the
     // current archive is the most recent one.

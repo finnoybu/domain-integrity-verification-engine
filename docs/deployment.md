@@ -20,9 +20,26 @@ This document defines deployment expectations for Domain Integrity Engine.
 ## Required Environment Variables
 
 - `NODE_ENV=production`
-- `AUTH_ENABLED=true`
-- `AUTH_TOKEN=<strong-random-token>`
+- `ADMIN_BOOTSTRAP_EMAIL=<your-email>` — seeds the first admin user on first
+  boot (see Authentication below).
+- `DIVE_AUTH_FROM=<from-address>` — sender address for magic-link sign-in
+  emails (uses the same `DIVE_SMTP_*` transport as alerting).
 - `RATE_LIMIT_ENABLED=true` (recommended)
+
+### Optional — authentication
+
+- `DIVE_BASE_URL` — externally-visible base URL used to build sign-in links
+  (e.g. `https://dive.example.com`). If unset, derived from the request's
+  forwarded headers — set it explicitly when behind a reverse proxy whose
+  internal origin differs from the public URL.
+- `AUTH_TOKEN` — **legacy.** No longer gates the app. If set on first boot of
+  v0.3.0 (with an empty `api_tokens` table), its value is adopted into the
+  `api_tokens` table so existing `Authorization: Bearer` integrations keep
+  working. Rotate it afterwards from the CLI and drop the env var.
+- `DIVE_INSECURE_COOKIES=true` — disables the `Secure` cookie flag. Only for a
+  rare plain-HTTP production deployment; leave unset when serving over TLS.
+- `DIVE_AUTH_DEV_ECHO=true` — **local development only.** Prints the magic-link
+  URL to the server console instead of requiring SMTP. Never set in production.
 
 ### Optional — monitor
 
@@ -58,9 +75,40 @@ credentials are read from the environment, never the config file.
 
 - Run behind reverse proxy; do not expose internal process directly
 - Restrict inbound traffic to expected ports
-- Rotate `AUTH_TOKEN` on a regular interval
+- Rotate API tokens on a regular interval (`npm run token -- revoke <id>` then
+  mint a fresh one); keep the `users` table limited to current operators
 - Monitor API status and error rates
 - Keep host and runtime patched
+
+## Authentication
+
+DIVE is multi-user, single-install. Operators sign in with a **magic link**
+(no passwords); API clients authenticate with a **bearer token**.
+
+**Sign-in (browser).** `ADMIN_BOOTSTRAP_EMAIL` seeds the first admin user on
+first boot. That user visits `/login`, enters their email, and receives a
+single-use sign-in link (15-minute TTL) sent via the `DIVE_SMTP_*` transport.
+Consuming the link sets an HTTP-only, `SameSite=Lax`, `Secure` session cookie
+(30-day sliding TTL). Inviting additional users from the UI is a post-v0.3.0
+follow-up; until then the `users` table is seeded via `ADMIN_BOOTSTRAP_EMAIL`
+or edited directly.
+
+**API access (integrations, scripts).** Endpoints under `/api/*` accept either
+a valid session cookie or `Authorization: Bearer <token>` matching an active
+row in the `api_tokens` table. Manage tokens with the CLI:
+
+```sh
+npm run token -- mint "monitor-cron"   # prints the plaintext ONCE
+npm run token -- list                  # metadata only, never the plaintext
+npm run token -- revoke <id>
+```
+
+Tokens are stored hashed (SHA-256) and shown only at mint time. An existing
+`AUTH_TOKEN` is adopted automatically on first boot (see env vars) so upgrades
+don't break Bearer integrations.
+
+**Local development.** Set `DIVE_AUTH_DEV_ECHO=true` to print sign-in links to
+the server console instead of sending email — no SMTP server needed.
 
 ## Monitor
 

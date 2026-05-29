@@ -88,8 +88,13 @@ Stable API surface under `0.1.x`:
 
 ### Authentication Boundary
 
-- Bearer token enforcement on protected paths (`AUTH_ENABLED=true` by default)
+- Multi-user, single-install. Operators sign in via magic link (no passwords);
+  HTTP-only, `SameSite=Lax`, `Secure` session cookies with a 30-day sliding TTL
+- API clients authenticate with per-user, revocable bearer tokens (stored
+  hashed); the first admin is seeded from `ADMIN_BOOTSTRAP_EMAIL`
 - Deterministic `401` response shape via normalized API helper
+- See [docs/deployment.md](docs/deployment.md) for the sign-in flow and token
+  management CLI
 
 ### Rate Limiting
 

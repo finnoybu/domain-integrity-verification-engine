@@ -1,4 +1,4 @@
-import nodemailer from "nodemailer";
+import { sendEmail } from "./email";
 import type {
   AlertEvent,
   EmailChannelConfig,
@@ -8,10 +8,10 @@ import type {
 // ============================================================================
 // Alert dispatch channels.
 //
-// Email: nodemailer over SMTP. Works against AWS SES SMTP, Sendgrid SMTP,
-//   Mailgun SMTP, or any generic SMTP relay — the operator picks. SMTP
-//   credentials live in env vars (DIVE_SMTP_*); the JSON config holds only
-//   the from/to lists so it's safe to commit a redacted version.
+// Email: thin wrapper over the shared SMTP primitive in ./email.ts (same
+//   DIVE_SMTP_* env vars; magic-link sign-in uses the same transport). The
+//   JSON config holds only the from/to lists so it's safe to commit a
+//   redacted version.
 //
 // Webhook: HTTP POST of the events array to a configured URL. Covers Slack
 //   incoming webhooks, MS Teams connectors, and any custom HTTP endpoint
@@ -23,34 +23,7 @@ import type {
 // channels but also does not stop the persisted-state advance.
 // ============================================================================
 
-const SMTP_TIMEOUT_MS = 10_000;
 const WEBHOOK_TIMEOUT_MS = 10_000;
-
-interface SmtpEnv {
-  host: string;
-  port: number;
-  secure: boolean;
-  user?: string;
-  pass?: string;
-}
-
-function resolveSmtpEnv(): SmtpEnv {
-  const host = process.env.DIVE_SMTP_HOST;
-  if (!host) {
-    throw new Error(
-      "email channel: DIVE_SMTP_HOST is not set (DIVE_SMTP_PORT, DIVE_SMTP_USER, DIVE_SMTP_PASS, DIVE_SMTP_SECURE are also read)",
-    );
-  }
-  const portRaw = Number(process.env.DIVE_SMTP_PORT ?? "587");
-  const port = Number.isFinite(portRaw) && portRaw > 0 ? portRaw : 587;
-  return {
-    host,
-    port,
-    secure: process.env.DIVE_SMTP_SECURE === "true",
-    user: process.env.DIVE_SMTP_USER || undefined,
-    pass: process.env.DIVE_SMTP_PASS || undefined,
-  };
-}
 
 export async function dispatchEmail(
   events: AlertEvent[],
@@ -64,26 +37,12 @@ export async function dispatchEmail(
     throw new Error("email channel: 'to' recipient list is required in alerts.local.json");
   }
 
-  const smtp = resolveSmtpEnv();
-  const transporter = nodemailer.createTransport({
-    host: smtp.host,
-    port: smtp.port,
-    secure: smtp.secure,
-    auth: smtp.user && smtp.pass ? { user: smtp.user, pass: smtp.pass } : undefined,
-    connectionTimeout: SMTP_TIMEOUT_MS,
-    socketTimeout: SMTP_TIMEOUT_MS,
+  await sendEmail({
+    from: config.from,
+    to: config.to,
+    subject: formatSubject(events),
+    text: formatTextBody(events),
   });
-
-  try {
-    await transporter.sendMail({
-      from: config.from,
-      to: config.to.join(", "),
-      subject: formatSubject(events),
-      text: formatTextBody(events),
-    });
-  } finally {
-    transporter.close();
-  }
 }
 
 export async function dispatchWebhook(
