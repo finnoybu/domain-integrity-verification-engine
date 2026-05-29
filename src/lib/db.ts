@@ -42,7 +42,7 @@ function legacyJsonImportedPath(): string {
   return path.join(diveDataDir(), "domains.json.imported");
 }
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 let cached: BetterSqlite3Database | null = null;
 
@@ -70,6 +70,7 @@ export function getDb(): BetterSqlite3Database {
   importLegacyJsonIfPresent(db);
   bootstrapAdminFromEnv(db);
   adoptLegacyAuthTokenIfPresent(db);
+  importLegacyAlertsJsonIfPresent(db);
 
   cached = db;
   return db;
@@ -146,6 +147,127 @@ function adoptLegacyAuthTokenIfPresent(db: BetterSqlite3Database): void {
   ).run(tokenHash, admin.id, "legacy AUTH_TOKEN (adopted on upgrade)");
   console.log(
     "[auth] adopted existing AUTH_TOKEN into api_tokens — existing Bearer integrations keep working. Rotate it from the dashboard or CLI when convenient.",
+  );
+}
+
+interface LegacyAlertsConfig {
+  channels?: {
+    email?: { enabled?: boolean; from?: string; to?: string[] };
+    webhook?: {
+      enabled?: boolean;
+      url?: string;
+      method?: string;
+      headers?: Record<string, string>;
+    };
+  };
+  severities?: { info?: boolean; warning?: boolean; critical?: boolean };
+}
+
+/**
+ * v0.3.0 PR 5 upgrade path: import an existing `alerts.local.json` into the
+ * alert_channels / alert_routes tables on first boot, then archive the file
+ * (same one-shot pattern as the domains.json migration). Each configured
+ * channel becomes a channel row; the file's global severities become a default
+ * (scope='all') route per channel, so dispatch behaviour is preserved.
+ *
+ * Runs once: guarded by an empty alert_channels table. The file lives at the
+ * process cwd (matching alerting.ts's CONFIG_FILE), not the data dir.
+ */
+function importLegacyAlertsJsonIfPresent(db: BetterSqlite3Database): void {
+  const ALERTS_JSON = path.join(process.cwd(), "alerts.local.json");
+  const ALERTS_JSON_IMPORTED = path.join(
+    process.cwd(),
+    "alerts.local.json.imported",
+  );
+  if (!fs.existsSync(ALERTS_JSON)) return;
+
+  const channelCount = db
+    .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM alert_channels")
+    .get();
+  if (channelCount && channelCount.c > 0) return;
+
+  let parsed: LegacyAlertsConfig;
+  try {
+    parsed = JSON.parse(fs.readFileSync(ALERTS_JSON, "utf-8")) as LegacyAlertsConfig;
+  } catch (error) {
+    console.error(
+      "[alerts] failed to read alerts.local.json — leaving it in place; configure alerts in the dashboard:",
+      error,
+    );
+    return;
+  }
+
+  // Global severities → the list a default route forwards (true ones only).
+  const sev = parsed.severities ?? {};
+  const severities = (["info", "warning", "critical"] as const).filter(
+    (s) => sev[s],
+  );
+  const severitiesJson = JSON.stringify(
+    severities.length > 0 ? severities : ["warning", "critical"],
+  );
+
+  const insertChannel = db.prepare(
+    `INSERT INTO alert_channels (type, name, config_json, enabled) VALUES (?, ?, ?, ?)`,
+  );
+  const insertRoute = db.prepare(
+    `INSERT INTO alert_routes (scope_type, scope_value, channel_id, severities_json)
+     VALUES ('all', NULL, ?, ?)`,
+  );
+
+  let imported = 0;
+  const txn = db.transaction(() => {
+    const email = parsed.channels?.email;
+    if (email?.from) {
+      const result = insertChannel.run(
+        "smtp",
+        "Email (imported)",
+        JSON.stringify({ from: email.from, to: email.to ?? [] }),
+        email.enabled ? 1 : 0,
+      );
+      insertRoute.run(Number(result.lastInsertRowid), severitiesJson);
+      imported += 1;
+    }
+    const webhook = parsed.channels?.webhook;
+    if (webhook?.url) {
+      const result = insertChannel.run(
+        "webhook",
+        "Webhook (imported)",
+        JSON.stringify({
+          url: webhook.url,
+          method: webhook.method ?? "POST",
+          headers: webhook.headers ?? {},
+        }),
+        webhook.enabled ? 1 : 0,
+      );
+      insertRoute.run(Number(result.lastInsertRowid), severitiesJson);
+      imported += 1;
+    }
+  });
+
+  try {
+    txn();
+  } catch (error) {
+    console.error(
+      "[alerts] failed to import alerts.local.json — leaving it in place; database state rolled back:",
+      error,
+    );
+    return;
+  }
+
+  try {
+    if (fs.existsSync(ALERTS_JSON_IMPORTED)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      fs.renameSync(ALERTS_JSON_IMPORTED, `${ALERTS_JSON_IMPORTED}.${ts}`);
+    }
+    fs.renameSync(ALERTS_JSON, ALERTS_JSON_IMPORTED);
+  } catch (error) {
+    console.error(
+      "[alerts] imported alerts.local.json but failed to archive it — please move it manually:",
+      error,
+    );
+  }
+  console.log(
+    `[alerts] imported ${imported} channel(s) from alerts.local.json → alert_channels/alert_routes; original archived to alerts.local.json.imported`,
   );
 }
 
@@ -280,6 +402,47 @@ function runMigrations(db: BetterSqlite3Database): void {
       `);
       setStoredVersion(db, 2);
     })();
+  }
+
+  if (current < 3) {
+    // v3 — persisted alert configuration (PR 5). Replaces alerts.local.json:
+    //   alert_channels  N channels (smtp / webhook), each with a config blob.
+    //                   SMTP credentials still come from DIVE_SMTP_* env; the
+    //                   config holds only from/to (smtp) or url/method/headers
+    //                   (webhook). `enabled` mutes a channel without deleting
+    //                   its routes.
+    //   alert_routes    routing rules. scope_type 'all' (scope_value NULL) is
+    //                   the default; 'domain' (scope_value = domain) overrides
+    //                   the defaults for that one domain. severities_json lists
+    //                   the severities the route forwards. ON DELETE CASCADE so
+    //                   deleting a channel removes its routes.
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE alert_channels (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT NOT NULL,
+          name TEXT NOT NULL,
+          config_json TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE alert_routes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope_type TEXT NOT NULL,
+          scope_value TEXT,
+          channel_id INTEGER NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+          severities_json TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_alert_routes_scope ON alert_routes(scope_type, scope_value);
+        CREATE INDEX idx_alert_routes_channel ON alert_routes(channel_id);
+      `);
+      setStoredVersion(db, 3);
+    })();
+    // First-run import of any existing alerts.local.json runs after the tables
+    // exist — see importLegacyAlertsJsonIfPresent, called from getDb().
   }
 
   // Future migrations append here. Don't ever re-order an existing block.
