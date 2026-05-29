@@ -1,5 +1,11 @@
 import { getDb } from "./db";
-import type { AlertSeverity } from "./alerting";
+
+/**
+ * Severities an alert can carry. Lives here (not in alerting.ts) so the config
+ * lib stays at the bottom of the import graph — alerting.ts depends on this
+ * module for channels/routes, not the other way around.
+ */
+export type AlertSeverity = "info" | "warning" | "critical";
 
 // ============================================================================
 // Persisted alert configuration (PR 5). Channels and routes live in SQLite

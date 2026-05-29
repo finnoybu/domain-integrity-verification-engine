@@ -200,6 +200,87 @@ async function main(): Promise<void> {
     effForOther.every((r) => r.scopeType === "all"),
   );
 
+  // --- engine: dispatchPlanForDomain (override × severity × enabled) -----
+  const eng = await import("../src/lib/alerting");
+  const channelsAfter = await cfg.listChannels();
+  const routesAfter = await cfg.listRoutes();
+  const smtpFinal = channelsAfter.find((c) => c.type === "smtp")!;
+  const webhookFinal = channelsAfter.find((c) => c.type === "webhook")!;
+
+  const ts = new Date().toISOString();
+  const warningEvent = {
+    domain: "default.test",
+    kind: "stability_transition" as const,
+    severity: "warning" as const,
+    from: "stable",
+    to: "drift",
+    message: "x",
+    timestamp: ts,
+  };
+  const criticalEvent = { ...warningEvent, severity: "critical" as const, to: "risk" };
+
+  // default.test: 2 default routes ('all') — smtp enabled, webhook disabled.
+  // Both routes carry ["warning","critical"]. So the warning event should be
+  // queued only to the SMTP channel (the webhook channel is disabled).
+  const planDefault = eng.dispatchPlanForDomain(
+    "default.test",
+    [warningEvent],
+    { channels: channelsAfter, routes: routesAfter },
+  );
+  check("default-route dispatch skips the disabled channel",
+    planDefault.size === 1 &&
+    planDefault.has(smtpFinal.id) &&
+    !planDefault.has(webhookFinal.id),
+  );
+
+  // override.test: per-domain route → smtp only, severities ["warning","critical"]
+  const planOverride = eng.dispatchPlanForDomain(
+    "override.test",
+    [warningEvent, criticalEvent],
+    { channels: channelsAfter, routes: routesAfter },
+  );
+  check("override route receives both severities to its channel",
+    planOverride.size === 1 &&
+    planOverride.get(smtpFinal.id)?.length === 2,
+  );
+
+  // Add a per-domain route on a NEW channel that only forwards 'critical'.
+  const criticalOnlyChannel = await cfg.createChannel({
+    type: "smtp",
+    name: "Pager",
+    config: { from: "pager@example.test", to: ["oncall@example.test"] },
+    enabled: true,
+  });
+  await cfg.createRoute({
+    scopeType: "domain",
+    scopeValue: "pageonly.test",
+    channelId: criticalOnlyChannel.id,
+    severities: ["critical"],
+  });
+  const channelsAfter2 = await cfg.listChannels();
+  const routesAfter2 = await cfg.listRoutes();
+  const planSeverity = eng.dispatchPlanForDomain(
+    "pageonly.test",
+    [warningEvent, criticalEvent],
+    { channels: channelsAfter2, routes: routesAfter2 },
+  );
+  check("severity filter: 'critical'-only route drops the warning event",
+    planSeverity.get(criticalOnlyChannel.id)?.length === 1 &&
+    planSeverity.get(criticalOnlyChannel.id)?.[0].severity === "critical",
+  );
+
+  // Mute the channel: enabled=false → no events queued even with matching routes.
+  await cfg.updateChannel(criticalOnlyChannel.id, { enabled: false });
+  const channelsMuted = await cfg.listChannels();
+  const planMuted = eng.dispatchPlanForDomain(
+    "pageonly.test",
+    [criticalEvent],
+    { channels: channelsMuted, routes: routesAfter2 },
+  );
+  check("disabled channel produces no queued events",
+    !planMuted.has(criticalOnlyChannel.id),
+  );
+
   closeDb();
 }
 

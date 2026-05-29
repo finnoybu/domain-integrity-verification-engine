@@ -1,31 +1,44 @@
-import fs from "fs/promises";
-import path from "path";
 import {
   getLastAlerted,
   setLastAlerted,
   type LastAlertedRecord,
 } from "./storage";
 import { dispatchEmail, dispatchWebhook } from "./alert-channels";
+import {
+  effectiveRoutesForDomain,
+  loadAlertingConfig,
+  type AlertChannel,
+  type AlertRoute,
+  type AlertSeverity,
+  type SmtpChannelConfig,
+  type WebhookChannelConfig,
+} from "./alert-config";
 
 // ============================================================================
-// Alerting — Monitor Phase D.
+// Alerting — Monitor Phase D, persisted under PR 5.
 //
-// Computes alert events from state transitions, deduplicates against the
-// persisted `lastAlerted` record per domain, and dispatches via the
-// configured channels. The monitor worker is the only producer (see
-// docs/monitoring-design.md): dashboard / on-demand snapshots update domain
-// state but never dispatch — that keeps alert ordering deterministic and
-// avoids cross-process races.
+// Pipeline per tick / per domain:
 //
-// First-observation semantics: the very first time a field is observed for
-// a domain (no prior lastAlerted, or null for that field), the value is
-// recorded silently — no event, no dispatch. That's what keeps a fresh
-// install / newly-added domain from spamming.
+//   1. Compute alert events from state transitions (pure;
+//      computeAlertEvents). Field-level first observation yields no event so
+//      a fresh install / newly-added domain does not spam.
+//   2. Resolve the effective routes for the domain (OVERRIDE: per-domain
+//      routes replace defaults when present; see alert-config.ts).
+//   3. Per event, match against routes whose severities include this
+//      event's severity AND whose channel is enabled. Group resulting
+//      (channel → events) batches.
+//   4. Dispatch each batch via dispatchEmail / dispatchWebhook (the channel
+//      types). Errors are recorded per channel; dispatch failure does NOT
+//      block lastAlerted advancement (so a broken channel doesn't trigger
+//      re-alerts every tick).
+//   5. Persist lastAlerted.
+//
+// The monitor tick is the only producer — dashboard / on-demand snapshots
+// update domain state but never dispatch, which keeps alert ordering
+// deterministic and avoids cross-process races.
 // ============================================================================
 
-const CONFIG_FILE = path.join(process.cwd(), "alerts.local.json");
-
-export type AlertSeverity = "info" | "warning" | "critical";
+export type { AlertSeverity } from "./alert-config";
 
 export type AlertKind = "stability_transition" | "ownership_transition";
 
@@ -37,88 +50,6 @@ export interface AlertEvent {
   to: string;
   message: string;
   timestamp: string;
-}
-
-export interface EmailChannelConfig {
-  enabled?: boolean;
-  /** RFC 5322 From address. */
-  from?: string;
-  /** Recipient list. */
-  to?: string[];
-}
-
-export interface WebhookChannelConfig {
-  enabled?: boolean;
-  /** Full URL to POST to (Slack incoming webhook, MS Teams, custom HTTP endpoint). */
-  url?: string;
-  /** HTTP method. Defaults to POST. */
-  method?: string;
-  /** Extra headers (auth tokens, custom labels). */
-  headers?: Record<string, string>;
-}
-
-export interface AlertConfig {
-  channels: {
-    email: EmailChannelConfig;
-    webhook: WebhookChannelConfig;
-  };
-  /** Which severities trigger dispatch. info defaults off (often noise). */
-  severities: {
-    info: boolean;
-    warning: boolean;
-    critical: boolean;
-  };
-}
-
-const DEFAULT_CONFIG: AlertConfig = {
-  channels: {
-    email: { enabled: false },
-    webhook: { enabled: false },
-  },
-  severities: {
-    info: false,
-    warning: true,
-    critical: true,
-  },
-};
-
-/**
- * Loads `alerts.local.json` if present and shallow-merges it onto the
- * defaults. Missing / malformed file → defaults. Unknown fields are
- * preserved through the merge but ignored by the rest of the code.
- */
-export async function loadAlertConfig(): Promise<AlertConfig> {
-  try {
-    const content = await fs.readFile(CONFIG_FILE, "utf-8");
-    const parsed = JSON.parse(content) as Partial<AlertConfig>;
-    return mergeAlertConfig(DEFAULT_CONFIG, parsed);
-  } catch {
-    // File missing or invalid — fall back to defaults. The worker will
-    // log "would dispatch" events but won't actually send anything.
-    return DEFAULT_CONFIG;
-  }
-}
-
-function mergeAlertConfig(
-  defaults: AlertConfig,
-  partial: Partial<AlertConfig>,
-): AlertConfig {
-  return {
-    channels: {
-      email: {
-        ...defaults.channels.email,
-        ...(partial.channels?.email ?? {}),
-      },
-      webhook: {
-        ...defaults.channels.webhook,
-        ...(partial.channels?.webhook ?? {}),
-      },
-    },
-    severities: {
-      ...defaults.severities,
-      ...(partial.severities ?? {}),
-    },
-  };
 }
 
 function stabilitySeverity(to: string): AlertSeverity | null {
@@ -214,6 +145,11 @@ export function computeAlertEvents(
   return events;
 }
 
+export interface AlertingSet {
+  channels: AlertChannel[];
+  routes: AlertRoute[];
+}
+
 export interface ProcessAlertsResult {
   events: AlertEvent[];
   /** Number of channels successfully dispatched to. */
@@ -224,17 +160,47 @@ export interface ProcessAlertsResult {
 }
 
 /**
- * Computes transitions, dispatches via enabled channels (filtered by the
- * severities config), and persists the next `lastAlerted`. The lastAlerted
- * is updated regardless of dispatch success so a broken channel does not
- * cause re-alerts on every tick.
+ * Resolves the per-channel event batches for a domain under the override
+ * model. A channel receives an event only if there's a matching route (in the
+ * domain's effective set) whose severities include the event's severity AND
+ * the channel itself is enabled. Used by processAlerts; exported for tests.
+ */
+export function dispatchPlanForDomain(
+  domain: string,
+  events: AlertEvent[],
+  set: AlertingSet,
+): Map<number, AlertEvent[]> {
+  const routes = effectiveRoutesForDomain(domain, set.routes);
+  const channelsById = new Map(set.channels.map((c) => [c.id, c]));
+  const plan = new Map<number, AlertEvent[]>();
+  for (const event of events) {
+    for (const route of routes) {
+      if (!route.severities.includes(event.severity)) continue;
+      const channel = channelsById.get(route.channelId);
+      if (!channel || !channel.enabled) continue;
+      const batch = plan.get(channel.id) ?? [];
+      // De-dup: the same channel may match via two routes (rare, but
+      // possible if both list the severity); only count the event once.
+      if (!batch.includes(event)) batch.push(event);
+      plan.set(channel.id, batch);
+    }
+  }
+  return plan;
+}
+
+/**
+ * Computes transitions, dispatches via the channels resolved by the routing
+ * rules, and persists the next `lastAlerted`. The lastAlerted is updated
+ * regardless of dispatch success so a broken channel does not cause re-alerts
+ * on every tick. `config` is the pre-loaded channel + route set; pass it once
+ * per tick from the worker and reuse across domains (cheaper than re-querying).
  */
 export async function processAlerts(
   domain: string,
   current: CurrentStates,
-  config?: AlertConfig,
+  config?: AlertingSet,
 ): Promise<ProcessAlertsResult> {
-  const cfg = config ?? (await loadAlertConfig());
+  const set = config ?? (await loadAlertingConfig());
   const lastAlerted = await getLastAlerted(domain);
   const timestamp = new Date().toISOString();
 
@@ -243,26 +209,24 @@ export async function processAlerts(
   let dispatched = 0;
   const errors: Array<{ channel: string; error: string }> = [];
 
-  const dispatchable = events.filter((e) => cfg.severities[e.severity]);
-  if (dispatchable.length > 0) {
-    if (cfg.channels.email.enabled) {
+  if (events.length > 0) {
+    const plan = dispatchPlanForDomain(domain, events, set);
+    const channelsById = new Map(set.channels.map((c) => [c.id, c]));
+    for (const [channelId, batch] of plan) {
+      const channel = channelsById.get(channelId);
+      if (!channel || batch.length === 0) continue;
       try {
-        await dispatchEmail(dispatchable, cfg.channels.email);
+        if (channel.type === "smtp") {
+          await dispatchEmail(batch, channel.config as SmtpChannelConfig);
+        } else if (channel.type === "webhook") {
+          await dispatchWebhook(batch, channel.config as WebhookChannelConfig);
+        } else {
+          throw new Error(`unknown channel type: ${channel.type}`);
+        }
         dispatched += 1;
       } catch (error) {
         errors.push({
-          channel: "email",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    if (cfg.channels.webhook.enabled) {
-      try {
-        await dispatchWebhook(dispatchable, cfg.channels.webhook);
-        dispatched += 1;
-      } catch (error) {
-        errors.push({
-          channel: "webhook",
+          channel: `${channel.type}#${channel.id} (${channel.name})`,
           error: error instanceof Error ? error.message : String(error),
         });
       }
