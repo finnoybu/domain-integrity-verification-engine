@@ -1,5 +1,5 @@
 {
-  "_doc": "Copy to alerts.local.json (gitignored, like ruleset.local.json) and edit. Both channels default to disabled — DIVE will compute and log alert events without dispatching until at least one channel is enabled. SMTP credentials live in env vars (DIVE_SMTP_HOST, DIVE_SMTP_PORT, DIVE_SMTP_USER, DIVE_SMTP_PASS, DIVE_SMTP_SECURE).",
+  "_doc": "Legacy first-boot import format. Under v0.3.0+, alert channels and routes live in SQLite and are managed from the dashboard (/alerts plus the Routing section on each domain's detail page). On first boot with alerts.local.json present at the cwd, each configured channel is imported into alert_channels and the global severities become a default route per channel; the file is then archived to alerts.local.json.imported. SMTP credentials live in env vars (DIVE_SMTP_HOST, DIVE_SMTP_PORT, DIVE_SMTP_USER, DIVE_SMTP_PASS, DIVE_SMTP_SECURE).",
   "channels": {
     "email": {
       "enabled": false,
