@@ -1,9 +1,6 @@
 import { sendEmail } from "./email";
-import type {
-  AlertEvent,
-  EmailChannelConfig,
-  WebhookChannelConfig,
-} from "./alerting";
+import type { AlertEvent } from "./alerting";
+import type { SmtpChannelConfig, WebhookChannelConfig } from "./alert-config";
 
 // ============================================================================
 // Alert dispatch channels.
@@ -27,14 +24,14 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
 
 export async function dispatchEmail(
   events: AlertEvent[],
-  config: EmailChannelConfig,
+  config: SmtpChannelConfig,
 ): Promise<void> {
   if (events.length === 0) return;
   if (!config.from) {
-    throw new Error("email channel: 'from' is required in alerts.local.json");
+    throw new Error("smtp channel: 'from' is required in the channel config");
   }
   if (!config.to || config.to.length === 0) {
-    throw new Error("email channel: 'to' recipient list is required in alerts.local.json");
+    throw new Error("smtp channel: 'to' recipient list is required in the channel config");
   }
 
   await sendEmail({
@@ -51,7 +48,7 @@ export async function dispatchWebhook(
 ): Promise<void> {
   if (events.length === 0) return;
   if (!config.url) {
-    throw new Error("webhook channel: 'url' is required in alerts.local.json");
+    throw new Error("webhook channel: 'url' is required in the channel config");
   }
 
   const controller = new AbortController();

@@ -55,8 +55,9 @@ This document defines deployment expectations for Domain Integrity Engine.
 
 ### Optional — alert email channel
 
-Used only when the email channel is enabled in `alerts.local.json`. SMTP
-credentials are read from the environment, never the config file.
+Used only when an SMTP channel exists and is enabled in the dashboard's
+Alerts page. Credentials are read from the environment, never the channel
+config in the database.
 
 - `DIVE_SMTP_HOST` — SMTP relay host (e.g. `email-smtp.us-east-1.amazonaws.com`).
 - `DIVE_SMTP_PORT` — SMTP port (default `587`).
@@ -182,28 +183,22 @@ correct architecture (see docs/dashboard-design.md, Monitor architecture).
 ### Alerting
 
 State transitions detected per tick (stability + ownership) fire alerts
-through any channel enabled in `alerts.local.json`. The file is read once
-per tick — config edits take effect on the next scheduled tick. Copy
-`alerts.sample.json` to `alerts.local.json` (gitignored, like
-`ruleset.local.json`) and edit:
+through any **channel** that a matching **route** sends to. Both live in
+SQLite (`alert_channels` / `alert_routes`) and are managed from the
+dashboard — see **/alerts** for channel CRUD and default (all-domains)
+routes, and the **Routing** section on a domain's detail page for
+per-domain overrides.
 
-```jsonc
-{
-  "channels": {
-    "email":   { "enabled": false, "from": "dive@you.com", "to": ["ops@you.com"] },
-    "webhook": { "enabled": false, "url": "https://hooks.slack.com/services/…" }
-  },
-  "severities": { "info": false, "warning": true, "critical": true }
-}
-```
-
-- Both channels default to disabled — DIVE computes and logs alert events
-  either way, but nothing dispatches until at least one is enabled.
-- SMTP credentials for the email channel come from `DIVE_SMTP_*` env vars
-  (see above); the config holds only the from/to lists, so a redacted
-  config is safe to share.
-- The webhook channel POSTs `{ "events": [...] }` to the configured URL,
-  with a 10s timeout and any extra `headers` you set.
+- **Channels** are SMTP or webhook destinations. SMTP credentials come from
+  `DIVE_SMTP_*` env vars; the channel itself holds only the routing-relevant
+  config (from/to, or url/method/headers). A channel's `enabled` flag mutes
+  it without deleting its routes.
+- **Routes** map a scope (`all` or a single domain) to one channel, and list
+  which severities (`info` / `warning` / `critical`) the route forwards.
+- **Resolution is OVERRIDE:** if a domain has any per-domain routes, those
+  fully replace the defaults for that one domain; otherwise the default
+  routes apply. The monitor tick loads channels + routes once per pass, so
+  dashboard edits take effect on the next scheduled tick — no restart.
 - Severity is inferred from the new state: `critical` for risk / critical /
   invalid / ownership_failed; `warning` for drift; `info` for stable
   recoveries and verified-ownership confirmations.
@@ -211,6 +206,16 @@ per tick — config edits take effect on the next scheduled tick. Copy
   alert exactly once and a fresh tick invocation does not re-fire alerts for
   the current state. The first observation of a domain initialises the
   record silently.
+
+#### Upgrading from `alerts.local.json` (pre-v0.3.0)
+
+On first boot under v0.3.0 with an existing `alerts.local.json` at the
+process cwd, each configured channel is imported into `alert_channels` and
+the global severities become a default route per channel — dispatch
+behaviour is preserved. The original file is archived to
+`alerts.local.json.imported`. The committed `alerts.sample.json` documents
+the import-source format; configure all subsequent changes from the
+dashboard.
 
 ### App process management (sketch)
 

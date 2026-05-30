@@ -38,11 +38,11 @@ import {
 import { createSnapshot } from "@/lib/snapshot";
 import { OWNERSHIP_FAILURE_THRESHOLD, recordOwnershipCheck } from "@/lib/ownership";
 import {
-  loadAlertConfig,
   processAlerts,
-  type AlertConfig,
+  type AlertingSet,
   type CurrentStates,
 } from "@/lib/alerting";
+import { loadAlertingConfig } from "@/lib/alert-config";
 
 export interface TickSummary {
   active: number;
@@ -90,7 +90,7 @@ installShutdownHandlers.installed = false;
 
 async function runTickForDomain(
   domain: string,
-  alertConfig: AlertConfig,
+  alertConfig: AlertingSet,
   summary: TickSummary,
 ): Promise<void> {
   try {
@@ -162,7 +162,7 @@ async function runTickForDomain(
 async function dispatchAndLog(
   domain: string,
   current: CurrentStates,
-  alertConfig: AlertConfig,
+  alertConfig: AlertingSet,
 ): Promise<void> {
   const result = await processAlerts(domain, current, alertConfig);
   if (result.initialized) {
@@ -190,10 +190,13 @@ async function dispatchAndLog(
  * stop request between domains so a SIGINT mid-tick exits cleanly.
  */
 export async function runOneTick(): Promise<TickSummary> {
-  const alertConfig = await loadAlertConfig();
+  // Load channels + routes once per tick — the dashboard mutates them between
+  // ticks, but resolution per domain is cheap (in-memory filtering).
+  const alertConfig = await loadAlertingConfig();
   const access = await getDomainAccess();
+  const enabledChannels = alertConfig.channels.filter((c) => c.enabled).length;
   log(
-    `tick start — ${access.active.length} active, ${access.frozen.length} frozen (skipped), license=${access.license.tier ?? "free"}, alerting=email:${alertConfig.channels.email.enabled ? "on" : "off"}/webhook:${alertConfig.channels.webhook.enabled ? "on" : "off"}`,
+    `tick start — ${access.active.length} active, ${access.frozen.length} frozen (skipped), license=${access.license.tier ?? "free"}, alerting=${enabledChannels}/${alertConfig.channels.length} channels enabled, ${alertConfig.routes.length} routes`,
   );
 
   const summary: TickSummary = {

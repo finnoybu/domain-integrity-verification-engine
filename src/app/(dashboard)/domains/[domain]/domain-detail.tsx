@@ -14,6 +14,7 @@ import type {
   StatusResult,
   StatusSignal,
 } from "../types";
+import { RoutingSection } from "./routing-section";
 
 export function DomainDetail({ domain }: { domain: string }) {
   const router = useRouter();
@@ -465,6 +466,10 @@ export function DomainDetail({ domain }: { domain: string }) {
           No snapshot data available yet.
         </Card>
       ) : null}
+
+      {/* Per-domain alert routing — rendered for any known domain so it's
+          configurable before verification too. */}
+      {domainData ? <RoutingSection domain={domain} /> : null}
     </div>
   );
 }

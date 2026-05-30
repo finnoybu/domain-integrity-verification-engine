@@ -5,10 +5,10 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { SignOutButton } from "../sign-out-button";
 
-// Alerts (/alerts) and Settings (/settings) arrive in PR 5 and PR 6 — they're
-// intentionally absent until their pages exist.
+// Settings (/settings) lands in PR 6; until then it's intentionally absent.
 const NAV_LINKS = [
   { href: "/domains", label: "Domains" },
+  { href: "/alerts", label: "Alerts" },
   { href: "/license", label: "License" },
   { href: "/account", label: "Account" },
 ];
