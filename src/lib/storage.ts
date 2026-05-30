@@ -161,6 +161,7 @@ interface DomainRow {
   last_alerted_stability: string | null;
   last_alerted_ownership: string | null;
   last_alerted_at: string | null;
+  last_check_at: string | null;
 }
 
 function rowToOwnership(row: DomainRow): OwnershipRecord {
@@ -506,6 +507,30 @@ export async function setLastAlerted(
        WHERE name = ?`,
     )
     .run(record.stabilityState, record.ownershipState, record.lastAlertedAt, domain);
+}
+
+/**
+ * Last time the monitor tick (or an on-demand path that takes a snapshot)
+ * actually did work for this domain — null until the first successful
+ * snapshot or ownership check. The PR 6 scheduler reads this to decide
+ * whether a domain is past-due under its effective interval.
+ */
+export async function getLastCheckAt(domain: string): Promise<string | null> {
+  const row = fetchRow(domain);
+  return row?.last_check_at ?? null;
+}
+
+export async function setLastCheckAt(
+  domain: string,
+  timestamp: string = new Date().toISOString(),
+): Promise<void> {
+  getDb()
+    .prepare(
+      `UPDATE domains
+       SET last_check_at = ?, updated_at = datetime('now')
+       WHERE name = ?`,
+    )
+    .run(timestamp, domain);
 }
 
 export async function deleteDomain(domain: string): Promise<boolean> {
