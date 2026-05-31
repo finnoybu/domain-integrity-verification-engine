@@ -5,6 +5,7 @@ import tls from "tls";
 import { promises as dns } from "dns";
 import { getLicenseStatus, type LicenseStatus } from "./license";
 import { getDb } from "./db";
+import { getGlobalSetting } from "./settings";
 
 export interface DomainSOA {
   primaryNs: string;
@@ -215,19 +216,15 @@ export function createOwnershipRecord(): OwnershipRecord {
 }
 
 /**
- * Snapshots retained per domain. Configurable via the SNAPSHOT_RETENTION
- * environment variable; defaults to 30 (about a month of daily history).
- * A floor of 2 is enforced so the diff engine always has a prior snapshot.
+ * Snapshots retained per domain. PR 6 makes this dashboard-overridable via
+ * the settings lib (DB → SNAPSHOT_RETENTION env → default 30, min 2 enforced
+ * so the diff engine always has a prior snapshot to compare). Resolved per
+ * call to enforceSnapshotRetention so dashboard edits take effect on the
+ * next persisted snapshot — no restart.
  */
-function resolveSnapshotRetention(): number {
-  const configured = Number(process.env.SNAPSHOT_RETENTION);
-  if (Number.isInteger(configured) && configured >= 2) {
-    return configured;
-  }
-  return 30;
+async function resolveSnapshotRetention(): Promise<number> {
+  return getGlobalSetting("snapshot_retention");
 }
-
-export const MAX_SNAPSHOTS_PER_DOMAIN = resolveSnapshotRetention();
 
 /**
  * Returns a canonical base DomainSnapshot with all fields present (v0.0.7 schema).
@@ -650,15 +647,16 @@ async function listSnapshotsForDomain(domain: string): Promise<DomainSnapshot[]>
  */
 async function enforceSnapshotRetention(domain: string): Promise<void> {
   const domainDir = path.join(SNAPSHOTS_DIR, domain);
-  
+  const max = await resolveSnapshotRetention();
+
   try {
     const files = await fs.readdir(domainDir);
     const jsonFiles = files.filter((f) => f.endsWith(".json")).sort();
 
     // If too many snapshots exist, delete oldest first
-    if (jsonFiles.length > MAX_SNAPSHOTS_PER_DOMAIN) {
-      const filesToDelete = jsonFiles.slice(0, jsonFiles.length - MAX_SNAPSHOTS_PER_DOMAIN);
-      
+    if (jsonFiles.length > max) {
+      const filesToDelete = jsonFiles.slice(0, jsonFiles.length - max);
+
       for (const file of filesToDelete) {
         const filepath = path.join(domainDir, file);
         await fs.unlink(filepath);
