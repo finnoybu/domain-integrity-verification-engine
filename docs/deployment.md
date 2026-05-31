@@ -43,15 +43,23 @@ This document defines deployment expectations for Domain Integrity Engine.
 
 ### Optional — monitor
 
+All three numeric monitor settings are also dashboard-overridable on
+`/settings` (PR 6) — the env value below is the fallback used when no
+dashboard override is set. Effective resolution is per-domain → dashboard
+→ env → built-in default.
+
 - `OWNERSHIP_LOOKUP_TIMEOUT_MS` — TXT lookup timeout for the
-  proof-of-control gate (default `5000`).
+  proof-of-control gate (default `5000`, range 500–60000).
 - `SNAPSHOT_RETENTION` — snapshots kept per domain on disk (default `30`,
-  floor `2`).
+  range 2–10000; the floor exists so the diff engine always has a prior
+  snapshot to compare).
 - `DIVE_LICENSE` — license token, if any. Determines the active-domain
   capacity the tick iterates each pass.
-- `MONITOR_INTERVAL` — read only by the dev-loop wrapper (`npm run
-  monitor`); the production scheduler (cron / systemd timer) owns cadence.
-  Default `3600`, floor `60`.
+- `MONITOR_INTERVAL` — default cadence the production scheduler should
+  honor (default `3600`, range 60–604800). The scheduled tick uses this
+  per domain (plus any per-domain override on a domain's detail page) to
+  decide which active domains are past-due each pass; `npm run monitor`
+  (the dev-loop wrapper) also reads it for its sleep between iterations.
 
 ### Optional — alert email channel
 
