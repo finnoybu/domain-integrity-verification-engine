@@ -78,7 +78,9 @@ async function main(): Promise<void> {
   check("v3 tables created", JSON.stringify(tables) === JSON.stringify(["alert_channels", "alert_routes"]));
 
   const version = db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as { value: string };
-  check("schema version stamped to 3", version.value === "3");
+  // v3 introduced these tables; later versions still run through. Assert "≥ 3"
+  // so this smoke survives future migration ladder additions.
+  check("schema version ≥ 3", Number(version.value) >= 3);
 
   // --- alerts.local.json import ----------------------------------------
   const channels = await cfg.listChannels();

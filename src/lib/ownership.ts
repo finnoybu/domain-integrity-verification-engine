@@ -6,6 +6,7 @@ import {
   setOwnership,
   type OwnershipRecord,
 } from "./storage";
+import { getGlobalSetting } from "./settings";
 
 // ============================================================================
 // Ownership verification — the continuous proof-of-control gate.
@@ -26,13 +27,13 @@ import {
 /** Threshold of consecutive failed checks that flips state to ownership_failed. */
 export const OWNERSHIP_FAILURE_THRESHOLD = 3;
 
-/** TXT lookup timeout in milliseconds. Override with OWNERSHIP_LOOKUP_TIMEOUT_MS. */
-function resolveLookupTimeoutMs(): number {
-  const configured = Number(process.env.OWNERSHIP_LOOKUP_TIMEOUT_MS);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-  return 5000;
+/**
+ * Resolves the TXT-lookup timeout (in milliseconds) through the settings
+ * lib — DB → env (OWNERSHIP_LOOKUP_TIMEOUT_MS) → default. PR 6 makes this
+ * dashboard-overridable; the env var stays as the operator-config fallback.
+ */
+function resolveLookupTimeoutMs(): Promise<number> {
+  return getGlobalSetting("ownership_lookup_timeout_ms");
 }
 
 export type OwnershipVerifyFailReason =
@@ -53,7 +54,7 @@ export async function verifyOwnership(
   expectedToken: string,
 ): Promise<OwnershipVerifyResult> {
   const record = ownershipVerificationRecord(domain);
-  const timeoutMs = resolveLookupTimeoutMs();
+  const timeoutMs = await resolveLookupTimeoutMs();
 
   let txtRecords: string[][];
   try {

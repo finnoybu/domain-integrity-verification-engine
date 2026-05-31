@@ -42,7 +42,7 @@ function legacyJsonImportedPath(): string {
   return path.join(diveDataDir(), "domains.json.imported");
 }
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 let cached: BetterSqlite3Database | null = null;
 
@@ -443,6 +443,36 @@ function runMigrations(db: BetterSqlite3Database): void {
     })();
     // First-run import of any existing alerts.local.json runs after the tables
     // exist — see importLegacyAlertsJsonIfPresent, called from getDb().
+  }
+
+  if (current < 4) {
+    // v4 — UI-overridable global + per-domain settings (PR 6). Today the
+    // monitor reads MONITOR_INTERVAL / SNAPSHOT_RETENTION /
+    // OWNERSHIP_LOOKUP_TIMEOUT_MS from env at module load; this lets the
+    // dashboard override them (DB → env → hardcoded default), and lets each
+    // domain carry its own interval. The schedule column on domains records
+    // the last successful check so the tick can skip not-yet-due domains.
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE domain_settings (
+          domain TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (domain, key)
+        );
+        CREATE INDEX idx_domain_settings_domain ON domain_settings(domain);
+
+        ALTER TABLE domains ADD COLUMN last_check_at TEXT;
+      `);
+      setStoredVersion(db, 4);
+    })();
   }
 
   // Future migrations append here. Don't ever re-order an existing block.
