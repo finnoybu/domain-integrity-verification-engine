@@ -89,15 +89,19 @@ export async function POST(request: NextRequest) {
       return badRequest("Request body must be a JSON object", requestId);
     }
 
+    // `return await` so the handler's rejection actually reaches the
+    // try/catch — without the await, the unhandled-rejection skips the
+    // catch and `setSetting`'s range-validation throw surfaces as a generic
+    // 500 instead of the intended 400.
     switch (body.action) {
       case "set_global":
-        return handleSetGlobal(body, requestId);
+        return await handleSetGlobal(body, requestId);
       case "clear_global":
-        return handleClearGlobal(body, requestId);
+        return await handleClearGlobal(body, requestId);
       case "set_domain":
-        return handleSetDomain(body, requestId);
+        return await handleSetDomain(body, requestId);
       case "clear_domain":
-        return handleClearDomain(body, requestId);
+        return await handleClearDomain(body, requestId);
       default:
         return badRequest(`Unknown action: ${String(body.action ?? "(missing)")}`, requestId);
     }
