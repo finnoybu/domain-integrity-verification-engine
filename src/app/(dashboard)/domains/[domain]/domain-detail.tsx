@@ -15,6 +15,7 @@ import type {
   StatusSignal,
 } from "../types";
 import { RoutingSection } from "./routing-section";
+import { IntervalSection } from "./interval-section";
 
 export function DomainDetail({ domain }: { domain: string }) {
   const router = useRouter();
@@ -335,7 +336,7 @@ export function DomainDetail({ domain }: { domain: string }) {
                         style={{ borderLeftColor: SEVERITY_COLORS[severity] }}
                       >
                         <span
-                          className="inline-block min-w-[72px] rounded px-2 py-0.5 text-center text-xs font-bold uppercase tracking-wide text-white"
+                          className="inline-block min-w-18 rounded px-2 py-0.5 text-center text-xs font-bold uppercase tracking-wide text-white"
                           style={{ backgroundColor: SEVERITY_COLORS[severity] }}
                         >
                           {severity}
@@ -419,13 +420,13 @@ export function DomainDetail({ domain }: { domain: string }) {
                       </div>
                       <div className="grid grid-cols-[auto_1fr] gap-2 text-xs">
                         <span className="font-medium text-destructive">From:</span>
-                        <span className="break-words">
+                        <span className="wrap-break-word">
                           {Array.isArray(d.from) ? JSON.stringify(d.from) : String(d.from)}
                         </span>
                         <span className="font-medium text-emerald-600 dark:text-emerald-400">
                           To:
                         </span>
-                        <span className="break-words">
+                        <span className="wrap-break-word">
                           {Array.isArray(d.to) ? JSON.stringify(d.to) : String(d.to)}
                         </span>
                       </div>
@@ -448,7 +449,7 @@ export function DomainDetail({ domain }: { domain: string }) {
               </Button>
             </div>
             {showRawJson ? (
-              <pre className="max-h-[500px] overflow-auto rounded-md border border-border bg-muted/40 p-4 text-xs">
+              <pre className="max-h-125 overflow-auto rounded-md border border-border bg-muted/40 p-4 text-xs">
                 {JSON.stringify(snapshot, null, 2)}
               </pre>
             ) : null}
@@ -470,6 +471,9 @@ export function DomainDetail({ domain }: { domain: string }) {
       {/* Per-domain alert routing — rendered for any known domain so it's
           configurable before verification too. */}
       {domainData ? <RoutingSection domain={domain} /> : null}
+
+      {/* Per-domain check interval (PR 6). */}
+      {domainData ? <IntervalSection domain={domain} /> : null}
     </div>
   );
 }
