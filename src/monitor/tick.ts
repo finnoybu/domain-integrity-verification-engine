@@ -31,9 +31,11 @@ import {
   canSnapshotDomain,
   getDomainAccess,
   getDomainStatus,
+  getLastCheckAt,
   getOwnership,
   isValidDomain,
   persistSnapshot,
+  setLastCheckAt,
 } from "@/lib/storage";
 import { createSnapshot } from "@/lib/snapshot";
 import { OWNERSHIP_FAILURE_THRESHOLD, recordOwnershipCheck } from "@/lib/ownership";
@@ -43,12 +45,16 @@ import {
   type CurrentStates,
 } from "@/lib/alerting";
 import { loadAlertingConfig } from "@/lib/alert-config";
+import { isDue, nextCheckAtForDomain } from "@/lib/settings";
 
 export interface TickSummary {
   active: number;
   frozen: number;
   processed: number;
+  /** Domains within capacity + due, but stopped by an ownership-gate failure. */
   skipped: number;
+  /** Domains within capacity but their next-check time hasn't arrived yet. */
+  notDue: number;
   errors: number;
 }
 
@@ -93,6 +99,10 @@ async function runTickForDomain(
   alertConfig: AlertingSet,
   summary: TickSummary,
 ): Promise<void> {
+  // Stamp last_check_at at the very end of any reached domain — success,
+  // ownership-fail-skip, defensive return, or thrown error all count as
+  // "we did the per-domain work this tick," so the next-due math advances.
+  // Not-yet-due skips do NOT enter this function and so don't get stamped.
   try {
     // Snapshot the pre-tick state for accurate transition logging — the
     // ownership check writes to the store, so we have to read before calling
@@ -156,6 +166,14 @@ async function runTickForDomain(
   } catch (error) {
     logError(`${domain} tick error: ${error instanceof Error ? error.message : String(error)}`);
     summary.errors += 1;
+  } finally {
+    try {
+      await setLastCheckAt(domain);
+    } catch (err) {
+      logError(
+        `${domain} failed to record last_check_at: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
 
@@ -204,6 +222,7 @@ export async function runOneTick(): Promise<TickSummary> {
     frozen: access.frozen.length,
     processed: 0,
     skipped: 0,
+    notDue: 0,
     errors: 0,
   };
 
@@ -220,11 +239,24 @@ export async function runOneTick(): Promise<TickSummary> {
       summary.skipped += 1;
       continue;
     }
+    // Per-domain scheduling: skip if the effective interval (per-domain
+    // override → global → env → default) puts this domain in the future.
+    // Not-due domains don't enter runTickForDomain, so last_check_at isn't
+    // bumped — the next eligible tick picks them up.
+    const last = await getLastCheckAt(domain);
+    const next = await nextCheckAtForDomain(domain, last);
+    if (!isDue(next)) {
+      log(
+        `${domain} not yet due (next ${next?.toISOString() ?? "(unknown)"}) → skip`,
+      );
+      summary.notDue += 1;
+      continue;
+    }
     await runTickForDomain(domain, alertConfig, summary);
   }
 
   log(
-    `tick complete — processed=${summary.processed} skipped=${summary.skipped} errors=${summary.errors}`,
+    `tick complete — processed=${summary.processed} notDue=${summary.notDue} skipped=${summary.skipped} errors=${summary.errors}`,
   );
   return summary;
 }
